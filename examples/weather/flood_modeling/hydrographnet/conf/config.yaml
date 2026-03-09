@@ -21,16 +21,16 @@ hydra:
   job:
     chdir: True  # Change directory to the job's working directory.
   run:
-    dir: ./outputs_phy/  # Directory to save outputs.
+    dir: /home/woody/iwi5/iwi5416h/hydrographnet/outputs/
 
 # Data configuration: paths for training and testing datasets.
-data_dir: ./data
-test_dir: ./data/Test
+data_dir: /home/woody/iwi5/iwi5416h/hydrographnet/data
+test_dir: /home/woody/iwi5/iwi5416h/hydrographnet/data
 
 # Training configuration.
 batch_size: 1
-epochs: 100
-num_training_samples: 400
+epochs: 30
+num_training_samples: 425
 num_training_time_steps: 300
 lr: 0.0001
 lr_decay_rate: 0.9999979
@@ -39,9 +39,21 @@ num_input_features: 16    # Number of node input features.
 num_output_features: 2    # Number of output features (e.g., depth and volume differences).
 num_edge_features: 3      # Number of edge features.
 
+# Model architecture (paper Table 2).
+processor_size: 5              # Number of GN message-passing blocks.
+hidden_dim_processor: 64       # Hidden dimension in processor GN blocks.
+hidden_dim_node_encoder: 64    # Output dimension of KAN node encoder.
+hidden_dim_edge_encoder: 64    # Hidden dimension of edge encoder MLP.
+hidden_dim_node_decoder: 64    # Hidden dimension of node decoder MLP.
+num_layers_node_processor: 1   # MLP hidden layers per node update in processor.
+num_layers_edge_processor: 1   # MLP hidden layers per edge update in processor.
+num_layers_edge_encoder: 1     # MLP hidden layers in edge encoder.
+num_layers_node_decoder: 1     # MLP hidden layers in node decoder.
+num_harmonics: 5               # Fourier harmonics in KAN encoder.
+
 # Noise settings.
-noise_type: "none"        # Options: "none", "pushforward", "only_last", "correlated", etc.
-n_time_steps: 2           # Number of time steps in the sliding window.
+noise_type: "pushforward"  # Changed from "none" to match paper methodology
+n_time_steps: 2            # Number of time steps in the sliding window.
 
 # Physics loss settings.
 use_physics_loss: true
@@ -62,8 +74,8 @@ wandb_mode: disabled
 watch_model: False
 
 # Checkpoint path.
-ckpt_path: "./checkpoints_phy"
+ckpt_path: /home/woody/iwi5/iwi5416h/hydrographnet/outputs/checkpoints
 
 # Test and visualization configuration.
-num_test_samples: 10
+num_test_samples: 25
 num_test_time_steps: 30

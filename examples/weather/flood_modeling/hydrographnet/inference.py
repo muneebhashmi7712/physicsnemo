@@ -219,7 +219,21 @@ def main(cfg: DictConfig):
     num_input_features = cfg.get("num_input_features", 16)
     num_edge_features = cfg.get("num_edge_features", 3)
     num_output_features = cfg.get("num_output_features", 2)
-    model = MeshGraphKAN(num_input_features, num_edge_features, num_output_features)
+    model = MeshGraphKAN(
+        num_input_features,
+        num_edge_features,
+        num_output_features,
+        processor_size=cfg.get("processor_size", 5),
+        hidden_dim_processor=cfg.get("hidden_dim_processor", 64),
+        hidden_dim_node_encoder=cfg.get("hidden_dim_node_encoder", 64),
+        hidden_dim_edge_encoder=cfg.get("hidden_dim_edge_encoder", 64),
+        hidden_dim_node_decoder=cfg.get("hidden_dim_node_decoder", 64),
+        num_layers_node_processor=cfg.get("num_layers_node_processor", 1),
+        num_layers_edge_processor=cfg.get("num_layers_edge_processor", 1),
+        num_layers_edge_encoder=cfg.get("num_layers_edge_encoder", 1),
+        num_layers_node_decoder=cfg.get("num_layers_node_decoder", 1),
+        num_harmonics=cfg.get("num_harmonics", 5),
+    )
     model.to(device)
 
     # Load model checkpoint using the provided load_checkpoint utility.

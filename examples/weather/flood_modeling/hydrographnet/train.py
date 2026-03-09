@@ -114,10 +114,20 @@ class MGNTrainer:
             cfg.num_input_features,
             cfg.num_edge_features,
             cfg.num_output_features,
+            processor_size=cfg.processor_size,
             mlp_activation_fn=mlp_act,
+            num_layers_node_processor=cfg.num_layers_node_processor,
+            num_layers_edge_processor=cfg.num_layers_edge_processor,
+            hidden_dim_processor=cfg.hidden_dim_processor,
+            hidden_dim_node_encoder=cfg.hidden_dim_node_encoder,
+            hidden_dim_edge_encoder=cfg.hidden_dim_edge_encoder,
+            num_layers_edge_encoder=cfg.num_layers_edge_encoder,
+            hidden_dim_node_decoder=cfg.hidden_dim_node_decoder,
+            num_layers_node_decoder=cfg.num_layers_node_decoder,
             do_concat_trick=cfg.do_concat_trick,
             num_processor_checkpoint_segments=cfg.num_processor_checkpoint_segments,
             recompute_activation=cfg.recompute_activation,
+            num_harmonics=cfg.get("num_harmonics", 5),
         )
         if cfg.jit:
             if not self.model.meta.jit:
@@ -125,7 +135,10 @@ class MGNTrainer:
             self.model = torch.compile(self.model).to(self.dist.device)
         else:
             self.model = self.model.to(self.dist.device)
-        rank_zero_logger.info("Model instantiated successfully.")
+        total_params = sum(p.numel() for p in self.model.parameters())
+        rank_zero_logger.info(
+            f"Model instantiated successfully. Total parameters: {total_params:,}"
+        )
 
         if cfg.watch_model and not cfg.jit and self.dist.rank == 0:
             wandb.watch(self.model)
