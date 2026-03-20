@@ -1,69 +1,53 @@
-# SPDX-FileCopyrightText: Copyright (c) 2023 - 2026 NVIDIA CORPORATION & AFFILIATES.
-# SPDX-FileCopyrightText: All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-# Configuration file for HydroGraphNet training.
-# This file is used by Hydra to configure the training run.
+# Configuration file for HydroGraphNet training on UrbanFlood dataset.
+# Phase 1: 2D-only baseline — identical model architecture, different data pipeline.
 
 hydra:
   job:
-    chdir: True  # Change directory to the job's working directory.
+    chdir: True
   run:
-    dir: /home/woody/iwi5/iwi5416h/hydrographnet/outputs/
+    dir: /home/woody/iwi5/iwi5416h/urbanflood/outputs/
 
-# Data configuration: paths for training and testing datasets.
-data_dir: /home/woody/iwi5/iwi5416h/hydrographnet/data
-test_dir: /home/woody/iwi5/iwi5416h/hydrographnet/data
+# Data configuration.
+data_dir: /home/woody/iwi5/iwi5416h/urbanflood/data
+model_name: "Model_1"    # "Model_1" or "Model_2"
 
 # Training configuration.
 batch_size: 1
 epochs: 30
-num_training_samples: 425
+num_training_samples: 68   # All 68 train events for Model_1
 num_training_time_steps: 300
 lr: 0.0001
 lr_decay_rate: 0.9999979
 weight_decay: 0.0001
-num_input_features: 16    # Number of node input features.
-num_output_features: 2    # Number of output features (e.g., depth and volume differences).
-num_edge_features: 3      # Number of edge features.
+num_input_features: 16     # Unchanged from original.
+num_output_features: 2     # delta_water_level and delta_volume.
+num_edge_features: 3       # relative_x, relative_y, length.
 
-# Model architecture (paper Table 2).
-processor_size: 5              # Number of GN message-passing blocks.
-hidden_dim_processor: 64       # Hidden dimension in processor GN blocks.
-hidden_dim_node_encoder: 64    # Output dimension of KAN node encoder.
-hidden_dim_edge_encoder: 64    # Hidden dimension of edge encoder MLP.
-hidden_dim_node_decoder: 64    # Hidden dimension of node decoder MLP.
-num_layers_node_processor: 1   # MLP hidden layers per node update in processor.
-num_layers_edge_processor: 1   # MLP hidden layers per edge update in processor.
-num_layers_edge_encoder: 1     # MLP hidden layers in edge encoder.
-num_layers_node_decoder: 1     # MLP hidden layers in node decoder.
-num_harmonics: 5               # Fourier harmonics in KAN encoder.
+# Model architecture (unchanged from original — paper Table 2).
+processor_size: 5
+hidden_dim_processor: 64
+hidden_dim_node_encoder: 64
+hidden_dim_edge_encoder: 64
+hidden_dim_node_decoder: 64
+num_layers_node_processor: 1
+num_layers_edge_processor: 1
+num_layers_edge_encoder: 1
+num_layers_node_decoder: 1
+num_harmonics: 5
 
 # Noise settings.
-noise_type: "pushforward"  # Changed from "none" to match paper methodology
-n_time_steps: 2            # Number of time steps in the sliding window.
+noise_type: "pushforward"
+n_time_steps: 2
 
-# Physics loss settings.
-use_physics_loss: true
-delta_t: 1200.0
-physics_loss_weight: 1.0
+# Physics loss settings (disabled for Phase 1).
+use_physics_loss: false
+delta_t: 300.0              # 5 minutes in seconds.
+physics_loss_weight: 0.0
 
 # Performance and optimization configurations.
-use_apex: True            # Use NVIDIA Apex for mixed precision if available.
-amp: False                # Automatic mixed precision flag.
-jit: False                # Use TorchScript JIT compilation.
+use_apex: True
+amp: False
+jit: False
 num_dataloader_workers: 4
 do_concat_trick: False
 num_processor_checkpoint_segments: 0
@@ -74,8 +58,10 @@ wandb_mode: disabled
 watch_model: False
 
 # Checkpoint path.
-ckpt_path: /home/woody/iwi5/iwi5416h/hydrographnet/outputs/checkpoints
+ckpt_path: /home/woody/iwi5/iwi5416h/urbanflood/outputs/checkpoints
 
 # Test and visualization configuration.
-num_test_samples: 25
-num_test_time_steps: 30
+num_test_samples: 29        # All 29 test events for Model_1.
+num_test_time_steps: 44     # min(test event timesteps) - n_time_steps = 46 - 2.
+test_dir: /home/woody/iwi5/iwi5416h/urbanflood/data
+animation_output_dir: animations

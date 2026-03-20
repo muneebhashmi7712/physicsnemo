@@ -14,6 +14,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""
+Training script for HydroGraphNet on the UrbanFlood dataset (Phase 1: 2D-only baseline).
+Identical to train.py except for dataset import/instantiation and config name.
+"""
+
 import time
 
 import hydra
@@ -31,7 +36,7 @@ from torch.amp import GradScaler, autocast
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data.distributed import DistributedSampler
 
-from physicsnemo.datapipes.gnn.hydrographnet_dataset import HydroGraphDataset
+from physicsnemo.datapipes.gnn.hydrographnet_dataset import UrbanFloodDataset
 from physicsnemo.distributed.manager import DistributedManager
 from physicsnemo.utils.logging import PythonLogger, RankZeroLoggingWrapper
 from physicsnemo.utils.logging.wandb import initialize_wandb
@@ -66,8 +71,8 @@ class MGNTrainer:
 
         # Physics loss settings.
         self.use_physics_loss = cfg.get("use_physics_loss", False)
-        self.delta_t = cfg.get("delta_t", 1200.0)
-        self.physics_loss_weight = cfg.get("physics_loss_weight", 1.0)
+        self.delta_t = cfg.get("delta_t", 300.0)
+        self.physics_loss_weight = cfg.get("physics_loss_weight", 0.0)
 
         # Set activation function.
         mlp_act = "relu"
@@ -77,19 +82,16 @@ class MGNTrainer:
             )
             mlp_act = "silu"
 
-        rank_zero_logger.info("Initializing HydroGraphDataset...")
-        # Pass the flag to the dataset so it returns physics data only if needed.
-        dataset = HydroGraphDataset(
-            name="hydrograph_dataset",
+        rank_zero_logger.info("Initializing UrbanFloodDataset...")
+        dataset = UrbanFloodDataset(
+            name="urbanflood_dataset",
             data_dir=cfg.data_dir,
-            prefix="M80",
-            num_samples=500,
+            model_name=cfg.model_name,
+            split="train",
             n_time_steps=cfg.n_time_steps,
-            k=4,
             noise_type=cfg.noise_type,
             noise_std=0.01,
-            hydrograph_ids_file="train.txt",
-            split="train",
+            num_samples=cfg.num_training_samples,
             return_physics=self.use_physics_loss,
         )
         sampler = DistributedSampler(
@@ -192,8 +194,10 @@ class MGNTrainer:
         )
 
     def train(self, batch):
-        if self.use_physics_loss:
+        if isinstance(batch, (list, tuple)):
             graph, physics_data = batch
+            if not self.use_physics_loss:
+                physics_data = None
         else:
             graph = batch
             physics_data = None
@@ -294,10 +298,10 @@ def main(cfg: DictConfig) -> None:
     DistributedManager.initialize()
     dist = DistributedManager()
     initialize_wandb(
-        project="Modulus-Launch",
+        project="UrbanFlood-HydroGraphNet",
         entity="Modulus",
-        name="Vortex_Shedding-Training",
-        group="Vortex_Shedding-DDP-Group",
+        name="UrbanFlood-Phase1-Training",
+        group="UrbanFlood-DDP-Group",
         mode=cfg.wandb_mode,
     )
     logger = PythonLogger("main")
