@@ -20,10 +20,10 @@ Inference / rollout script for HydroGraphNet on UrbanFlood dataset.
 Identical to inference.py except for dataset import/instantiation and timestep scaling.
 
 For each test event, generates a four-panel animation:
-  1. Prediction (node colors = predicted water level)
-  2. Ground Truth (node colors = actual water level)
+  1. Prediction (node colors = predicted water depth above ground)
+  2. Ground Truth (node colors = actual water depth above ground)
   3. Absolute Error
-  4. RMSE curve over time
+  4. RMSE curve over time (in meters)
 """
 
 import os
@@ -55,10 +55,10 @@ def create_animation(
     Create a four-panel animation for one event rollout.
 
     Parameters:
-      rollout_predictions: list of predicted water level tensors (each shape: [num_nodes])
-      ground_truth: list of ground truth water level tensors (each shape: [num_nodes])
+      rollout_predictions: list of predicted water depth above ground tensors (meters)
+      ground_truth: list of ground truth water depth above ground tensors (meters)
       initial_graph: the initial PyG graph sample (used for node positions and edges)
-      rmse_list: list of RMSE values computed at each rollout step
+      rmse_list: list of RMSE values in meters computed at each rollout step
       output_path: file path to save the animation (e.g. a GIF file)
       time_per_step: simulation time (in hours) corresponding to each rollout step.
     """
@@ -77,9 +77,16 @@ def create_animation(
         for i in range(init_node_feats.shape[0])
     }
 
+    # Depth color scale: 0 to max depth across pred + GT.
     all_vals = torch.cat(rollout_predictions + ground_truth)
-    vmin_global = all_vals.min().item()
-    vmax_global = all_vals.max().item()
+    vmin_depth = 0.0
+    vmax_depth = max(all_vals.max().item(), 1e-6)
+
+    # Error color scale: 0 to max absolute error.
+    all_errors = torch.cat(
+        [torch.abs(p - g) for p, g in zip(rollout_predictions, ground_truth)]
+    )
+    vmax_error = max(all_errors.max().item(), 1e-6)
 
     def update(frame):
         for ax in axes.flat:
@@ -97,13 +104,13 @@ def create_animation(
             node_size=250,
             cmap=plt.cm.viridis,
             ax=axes[0, 0],
-            vmin=vmin_global,
-            vmax=vmax_global,
+            vmin=vmin_depth,
+            vmax=vmax_depth,
             node_shape="s",
         )
         nx.draw_networkx_edges(g_pred, pos, alpha=0.5, ax=axes[0, 0])
         axes[0, 0].set_title(f"Time {current_time:.2f} Hours - Prediction", fontsize=24)
-        fig.colorbar(nodes_pred, cax=cax1)
+        fig.colorbar(nodes_pred, cax=cax1, label="Depth (m)")
 
         # Panel 2: Ground Truth.
         gt_vals = ground_truth[frame].cpu().numpy()
@@ -116,15 +123,15 @@ def create_animation(
             node_size=250,
             cmap=plt.cm.viridis,
             ax=axes[0, 1],
-            vmin=vmin_global,
-            vmax=vmax_global,
+            vmin=vmin_depth,
+            vmax=vmax_depth,
             node_shape="s",
         )
         nx.draw_networkx_edges(g_gt, pos, alpha=0.5, ax=axes[0, 1])
         axes[0, 1].set_title(
             f"Time {current_time:.2f} Hours - Ground Truth", fontsize=24
         )
-        fig.colorbar(nodes_gt, cax=cax2)
+        fig.colorbar(nodes_gt, cax=cax2, label="Depth (m)")
 
         # Panel 3: Absolute Error.
         abs_error = torch.abs(rollout_predictions[frame] - ground_truth[frame])
@@ -136,30 +143,30 @@ def create_animation(
             pos,
             node_color=abs_vals,
             node_size=250,
-            cmap=plt.cm.viridis,
+            cmap=plt.cm.Reds,
             ax=axes[1, 0],
-            vmin=vmin_global,
-            vmax=vmax_global,
+            vmin=0.0,
+            vmax=vmax_error,
             node_shape="s",
         )
         nx.draw_networkx_edges(g_error, pos, alpha=0.5, ax=axes[1, 0])
         axes[1, 0].set_title(
             f"Time {current_time:.2f} Hours - Absolute Error", fontsize=24
         )
-        fig.colorbar(nodes_error, cax=cax3)
+        fig.colorbar(nodes_error, cax=cax3, label="Error (m)")
 
         # Panel 4: RMSE Curve.
         times = [(i + 1) * time_per_step for i in range(frame + 1)]
         axes[1, 1].plot(
             times,
             rmse_list[: frame + 1],
-            label="Water Level RMSE",
+            label="Water Depth RMSE",
             color="b",
             linewidth=3,
         )
         axes[1, 1].set_title("RMSE Over Time", fontsize=24)
         axes[1, 1].set_xlabel("Time (Hours)", fontsize=24)
-        axes[1, 1].set_ylabel("RMSE", fontsize=24)
+        axes[1, 1].set_ylabel("RMSE (m)", fontsize=24)
         axes[1, 1].legend(fontsize=20)
         axes[1, 1].grid(True)
 
@@ -198,6 +205,16 @@ def main(cfg: DictConfig):
         return_physics=False,
     )
     print(f"Loaded test dataset with {len(test_dataset)} events.")
+
+    # Normalization stats for denormalization to physical units.
+    wd_mean = test_dataset.dynamic_stats["water_depth"]["mean"]
+    wd_std = test_dataset.dynamic_stats["water_depth"]["std"]
+    elev_mean_raw = test_dataset.static_stats["elevation"]["mean"]
+    elev_std_raw = test_dataset.static_stats["elevation"]["std"]
+    # Static stats may be stored as single-element lists.
+    elev_mean = elev_mean_raw[0] if isinstance(elev_mean_raw, list) else elev_mean_raw
+    elev_std = elev_std_raw[0] if isinstance(elev_std_raw, list) else elev_std_raw
+    epsilon = 1e-8
 
     # Instantiate the model.
     num_input_features = cfg.get("num_input_features", 16)
@@ -250,6 +267,10 @@ def main(cfg: DictConfig):
         precip_seq = rollout_data["precipitation"].to(device)
         wd_gt_seq = rollout_data["water_depth_gt"].to(device)
 
+        # Denormalize ground elevation for water depth above ground.
+        elev_norm = X_current[:, 3]  # normalized elevation, column 3
+        elev_real = elev_norm * (elev_std + epsilon) + elev_mean
+
         X_iter = X_current.clone()
 
         for t in range(rollout_length):
@@ -283,18 +304,24 @@ def main(cfg: DictConfig):
                 [static_part_updated, water_depth_updated, volume_updated], dim=1
             )
 
-            rollout_preds.append(new_wd.squeeze(1).detach().cpu())
-            ground_truth_list.append(wd_gt_seq[t].detach().cpu())
+            # Denormalize to physical water level and compute depth above ground.
+            pred_wl = new_wd.squeeze(1) * (wd_std + epsilon) + wd_mean
+            gt_wl = wd_gt_seq[t] * (wd_std + epsilon) + wd_mean
+            pred_depth = torch.clamp(pred_wl - elev_real, min=0.0)
+            gt_depth = torch.clamp(gt_wl - elev_real, min=0.0)
+
+            rollout_preds.append(pred_depth.detach().cpu())
+            ground_truth_list.append(gt_depth.detach().cpu())
 
             rmse = torch.sqrt(
-                torch.mean((new_wd.squeeze(1) - wd_gt_seq[t]) ** 2)
+                torch.mean((pred_depth - gt_depth) ** 2)
             ).item()
             rmse_list.append(rmse)
 
         all_rmse_all.append(rmse_list)
         mean_rmse_sample = sum(rmse_list) / len(rmse_list)
         sample_id = test_dataset.dynamic_data[idx].get("event_id", idx)
-        print(f"Event {sample_id}: Mean RMSE = {mean_rmse_sample:.4f}")
+        print(f"Event {sample_id}: Mean RMSE = {mean_rmse_sample:.4f} m")
 
         anim_filename = os.path.join(anim_output_dir, f"animation_{sample_id}.gif")
         create_animation(rollout_preds, ground_truth_list, g, rmse_list, anim_filename)
@@ -302,8 +329,8 @@ def main(cfg: DictConfig):
     all_rmse_tensor = torch.tensor(all_rmse_all)
     overall_mean_rmse = torch.mean(all_rmse_tensor, dim=0)
     overall_std_rmse = torch.std(all_rmse_tensor, dim=0)
-    print("Overall Mean RMSE over rollout steps:", overall_mean_rmse)
-    print("Overall Std RMSE over rollout steps:", overall_std_rmse)
+    print("Overall Mean RMSE (m) over rollout steps:", overall_mean_rmse)
+    print("Overall Std RMSE (m) over rollout steps:", overall_std_rmse)
 
     # 5 minutes per step for UrbanFlood.
     timesteps = [(i + 1) * (5 / 60) for i in range(rollout_length)]
@@ -317,7 +344,7 @@ def main(cfg: DictConfig):
         label="± Std",
     )
     plt.xlabel("Time (Hours)", fontsize=20)
-    plt.ylabel("RMSE (Water Level)", fontsize=20)
+    plt.ylabel("RMSE (m)", fontsize=20)
     plt.title("Overall RMSE Curve Over Rollout", fontsize=24)
     plt.legend(fontsize=16)
     plt.grid(True)
