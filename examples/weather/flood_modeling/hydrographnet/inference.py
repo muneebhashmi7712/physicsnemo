@@ -39,6 +39,7 @@ from physicsnemo.utils import load_checkpoint
 
 from physicsnemo.datapipes.gnn.hydrographnet_dataset import UrbanFloodDataset
 from physicsnemo.models.meshgraphnet.meshgraphkan import MeshGraphKAN
+from model import HydroGraphKANWithEdgeDecoder
 
 from torch_geometric.utils import to_networkx
 
@@ -217,13 +218,11 @@ def main(cfg: DictConfig):
     epsilon = 1e-8
 
     # Instantiate the model.
-    num_input_features = cfg.get("num_input_features", 16)
-    num_edge_features = cfg.get("num_edge_features", 3)
-    num_output_features = cfg.get("num_output_features", 2)
-    model = MeshGraphKAN(
-        num_input_features,
-        num_edge_features,
-        num_output_features,
+    use_local_physics_loss = cfg.get("use_local_physics_loss", False)
+    model_args = dict(
+        input_dim_nodes=cfg.get("num_input_features", 16),
+        input_dim_edges=cfg.get("num_edge_features", 3),
+        output_dim=cfg.get("num_output_features", 2),
         processor_size=cfg.get("processor_size", 5),
         hidden_dim_processor=cfg.get("hidden_dim_processor", 64),
         hidden_dim_node_encoder=cfg.get("hidden_dim_node_encoder", 64),
@@ -235,6 +234,10 @@ def main(cfg: DictConfig):
         num_layers_node_decoder=cfg.get("num_layers_node_decoder", 1),
         num_harmonics=cfg.get("num_harmonics", 5),
     )
+    if use_local_physics_loss:
+        model = HydroGraphKANWithEdgeDecoder(**model_args)
+    else:
+        model = MeshGraphKAN(**model_args)
     model.to(device)
 
     # Load model checkpoint.
@@ -284,7 +287,8 @@ def main(cfg: DictConfig):
             )
 
             # Predict the differences (delta water_level and delta volume).
-            pred = model(X_input, edge_features, g)  # shape: (num_nodes, 2)
+            out = model(X_input, edge_features, g)
+            pred = out[0] if isinstance(out, tuple) else out  # shape: (num_nodes, 2)
             new_wd = water_depth_window[:, -1:] + pred[:, 0:1]
             new_vol = volume_window[:, -1:] + pred[:, 1:2]
 

@@ -131,6 +131,79 @@ def compute_physics_loss(pred, physics_data, graph, delta_t=1200.0):
         return torch.tensor(0.0, device=pred.device)
 
 
+def compute_edge_flow_loss(edge_pred, graph):
+    """
+    Compute supervised edge flow loss (DualFloodGNN ℒ_edge).
+
+    MSE between predicted delta-Q and ground truth delta-Q.
+    Both are in normalized volume per step units.
+
+    Args:
+        edge_pred (torch.Tensor): Edge predictions [E, 1] (delta-Q in normalized vol/step).
+        graph (PyGData): Graph with edge_y attribute containing ground truth delta-Q [E, 1].
+
+    Returns:
+        torch.Tensor: Scalar MSE loss.
+    """
+    return F.mse_loss(edge_pred, graph.edge_y)
+
+
+def compute_local_conservation_loss(
+    node_pred, edge_pred, graph, physics_data, delta_t=300.0
+):
+    """
+    Compute per-node local mass conservation loss (adapted from DualFloodGNN Eq. 18).
+
+    Reconstructs absolute flow Q = Q_prev + delta_Q_pred, then checks that
+    the predicted volume change at each node equals the net flow plus the
+    ground-truth source term S_gt.
+
+    S_gt is precomputed in the dataset as delta_V_gt - net_flow_gt, implicitly
+    capturing rainfall, infiltration, and any other external forcing that
+    inter-cell flows do not explain.
+
+    L_local = mean_i |delta_V_i - (net_flow_i + S_gt_i)|
+
+    Args:
+        node_pred (torch.Tensor): Node predictions [N, 2] (delta_depth, delta_volume).
+        edge_pred (torch.Tensor): Edge predictions [E, 1] (delta-Q in normalized vol/step).
+        graph (PyGData): Batched PyG graph with edge_index, edge_q_prev, and
+            source_term attributes.
+        physics_data (dict): Physics parameters (unused, kept for API compatibility).
+        delta_t (float): Time step in seconds (unused, kept for API compatibility).
+
+    Returns:
+        torch.Tensor: Scalar local conservation loss.
+    """
+    device = node_pred.device
+    num_nodes = node_pred.shape[0]
+
+    # delta_V in normalized volume space (model output).
+    delta_V = node_pred[:, 1]
+
+    # Reconstruct absolute Q from Q_prev + delta_Q_pred.
+    # Both in normalized volume per step units.
+    Q_pred = graph.edge_q_prev + edge_pred.squeeze(-1)
+
+    # Scatter Q into per-node inflow and outflow.
+    # With bidirectional edges (forward + negated reverse), each physical flow
+    # contributes twice to the scatter, so divide by 2 to correct.
+    edge_index = graph.edge_index  # [2, E]
+    Q_in = torch.zeros(num_nodes, device=device)
+    Q_in.scatter_add_(0, edge_index[1], Q_pred)
+    Q_out = torch.zeros(num_nodes, device=device)
+    Q_out.scatter_add_(0, edge_index[0], Q_pred)
+    net_flow = (Q_in - Q_out) / 2.0
+
+    # Use precomputed ground-truth source term (captures rainfall, infiltration,
+    # boundary effects -- everything not explained by inter-cell flows).
+    S_gt = graph.source_term.to(device)
+
+    # Per-node residual.
+    residual = delta_V - (net_flow + S_gt)
+    return residual.abs().mean()
+
+
 def custom_loss(pred, targets):
     """
     Compute a custom loss as the sum of MSE losses on water depth and volume predictions.

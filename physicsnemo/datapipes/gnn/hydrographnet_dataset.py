@@ -73,6 +73,7 @@ class UrbanFloodDataset(Dataset):
         num_samples: int = 500,
         rollout_length: Optional[int] = None,
         return_physics: bool = False,
+        delta_t: float = 300.0,
     ):
         if split not in {"train", "test"}:
             raise ValueError(f"Invalid split '{split}'. Expected 'train' or 'test'.")
@@ -87,6 +88,7 @@ class UrbanFloodDataset(Dataset):
         self.num_samples = num_samples
         self.rollout_length = rollout_length if rollout_length is not None else 0
         self.return_physics = return_physics
+        self.delta_t = delta_t
 
         self.static_data = {}
         self.dynamic_data = []
@@ -94,6 +96,7 @@ class UrbanFloodDataset(Dataset):
         self.event_ids = []
         self.static_stats = {}
         self.dynamic_stats = {}
+        self.num_fwd_edges = 0  # set during process()
 
         self.process()
 
@@ -175,12 +178,16 @@ class UrbanFloodDataset(Dataset):
             water_level, inflow, volume, rainfall = self.load_dynamic_data(
                 event_dir, num_nodes
             )
+            edge_flow = self.load_edge_dynamic_data(
+                event_dir, self.num_fwd_edges
+            )
             temp_dynamic_data.append(
                 {
                     "water_depth": water_level,
                     "inflow_hydrograph": inflow,
                     "volume": volume,
                     "precipitation": rainfall,
+                    "edge_flow": edge_flow,
                     "event_id": event_id,
                 }
             )
@@ -240,6 +247,7 @@ class UrbanFloodDataset(Dataset):
                     self.dynamic_stats["inflow_hydrograph"]["mean"],
                     self.dynamic_stats["inflow_hydrograph"]["std"],
                 ),
+                "edge_flow": dyn["edge_flow"],  # raw m³/s, converted at __getitem__ time
                 "event_id": dyn["event_id"],
             }
             self.dynamic_data.append(dyn_std)
@@ -317,6 +325,39 @@ class UrbanFloodDataset(Dataset):
             g.x = torch.tensor(node_features, dtype=torch.float)
             g.y = torch.tensor(target, dtype=torch.float)
 
+            # Edge flow targets: delta-Q and Q_prev in normalized volume per step.
+            if self.return_physics and self.num_fwd_edges > 0:
+                edge_flow = dyn["edge_flow"]  # (T, E_fwd) raw m³/s
+                flow_prev = edge_flow[prev_time, :]       # (E_fwd,) m³/s
+                flow_target = edge_flow[target_time, :]    # (E_fwd,) m³/s
+
+                # Make bidirectional: reverse edges carry negated flow.
+                flow_prev_bi = np.concatenate([flow_prev, -flow_prev])
+                flow_target_bi = np.concatenate([flow_target, -flow_target])
+
+                # Convert to normalized volume per step: Q_phys * dt / V_std
+                V_std = self.dynamic_stats["volume"]["std"]
+                delta_Q_norm = (flow_target_bi - flow_prev_bi) * self.delta_t / V_std
+                Q_prev_norm = flow_prev_bi * self.delta_t / V_std
+
+                g.edge_y = torch.tensor(delta_Q_norm, dtype=torch.float).unsqueeze(-1)
+                g.edge_q_prev = torch.tensor(Q_prev_norm, dtype=torch.float)
+
+                # Ground-truth per-node source term for local conservation loss.
+                # S_gt = delta_V_gt - net_flow_gt captures rainfall - infiltration
+                # + boundary effects — everything not explained by inter-cell flows.
+                delta_V_gt = dyn["volume"][target_time, :] - dyn["volume"][prev_time, :]
+                Q_target_norm = flow_target_bi * self.delta_t / V_std
+                num_nodes_s = sd["xy_coords"].shape[0]
+                Q_in_gt = np.zeros(num_nodes_s)
+                np.add.at(Q_in_gt, dst, Q_target_norm)
+                Q_out_gt = np.zeros(num_nodes_s)
+                np.add.at(Q_out_gt, src, Q_target_norm)
+                net_flow_gt = (Q_in_gt - Q_out_gt) / 2.0
+                g.source_term = torch.tensor(
+                    delta_V_gt - net_flow_gt, dtype=torch.float
+                )
+
             need_physics = self.return_physics or (self.noise_type == "pushforward")
             if need_physics:
                 past_volume = float(np.sum(dyn["volume"][prev_time, :]))
@@ -393,6 +434,10 @@ class UrbanFloodDataset(Dataset):
                     "precip_std": float(self.dynamic_stats["precipitation"]["std"]),
                     "num_nodes": float(sd["xy_coords"].shape[0]),
                     "area_sum": float(np.sum(sd["area_denorm"])),
+                    "area_mean": float(self.static_stats["area"]["mean"][0]),
+                    "area_std": float(self.static_stats["area"]["std"][0]),
+                    "infiltration_mean": float(self.static_stats["infiltration"]["mean"][0]),
+                    "infiltration_std": float(self.static_stats["infiltration"]["std"][0]),
                     "infiltration_area_sum": float(
                         np.sum(
                             self.denormalize(
@@ -649,10 +694,31 @@ class UrbanFloodDataset(Dataset):
 
         edge_features = np.hstack([rel_coords, length_norm[:, None]])
 
+        self.num_fwd_edges = len(src_fwd)
         logger.info(
             f"Loaded {len(src_fwd)} edges, made bidirectional: {edge_index.shape[1]} edges."
         )
         return edge_index, edge_features
+
+    def load_edge_dynamic_data(self, event_dir, num_edges):
+        """Load dynamic 2D edge flow data from a single event CSV.
+
+        Returns:
+            edge_flow: shape (T, num_edges) — flow rate per forward edge per timestep (m³/s).
+        """
+        csv_path = os.path.join(event_dir, "2d_edges_dynamic_all.csv")
+        # Columns: timestep, edge_idx, flow, velocity
+        raw = np.genfromtxt(csv_path, delimiter=",", skip_header=1)
+
+        timestep_col = raw[:, 0].astype(int)
+        flow_col = raw[:, 2]
+
+        timesteps = np.unique(timestep_col)
+        T = len(timesteps)
+
+        # Reshape to (T, num_edges) — data ordered by (timestep, edge_idx)
+        edge_flow = flow_col.reshape(T, num_edges)
+        return edge_flow
 
     def load_dynamic_data(self, event_dir, num_nodes):
         """Load dynamic 2D node data from a single event CSV.
