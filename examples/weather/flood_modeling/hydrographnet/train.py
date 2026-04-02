@@ -15,8 +15,12 @@
 # limitations under the License.
 
 import time
+import os
 
 import hydra
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import torch_geometric as pyg
@@ -37,7 +41,8 @@ from physicsnemo.utils.logging import PythonLogger, RankZeroLoggingWrapper
 from physicsnemo.utils.logging.wandb import initialize_wandb
 from physicsnemo.utils import load_checkpoint, save_checkpoint
 from physicsnemo.models.meshgraphnet.meshgraphkan import MeshGraphKAN
-from utils import compute_physics_loss
+from model import HydroGraphKANWithEdgeDecoder
+from utils import compute_physics_loss, compute_local_conservation_loss, compute_edge_regularization_loss
 
 
 # Custom collate function that checks if each item is a tuple (graph, physics_data) or a plain graph.
@@ -69,6 +74,16 @@ class MGNTrainer:
         self.delta_t = cfg.get("delta_t", 1200.0)
         self.physics_loss_weight = cfg.get("physics_loss_weight", 1.0)
 
+        # Local conservation loss settings.
+        self.use_local_physics_loss = cfg.get("use_local_physics_loss", False)
+        self.local_physics_loss_weight = cfg.get("local_physics_loss_weight", 0.1)
+        self.use_edge_smoothness = cfg.get("use_edge_smoothness", True)
+        self.local_loss_warmup_epochs = cfg.get("local_loss_warmup_epochs", 0)
+        self.use_boundary_masking = cfg.get("use_boundary_masking", False)
+        self.use_huber_residual = cfg.get("use_huber_residual", False)
+        self.huber_beta = cfg.get("huber_beta", 0.5)
+        self.current_epoch = 0  # updated by training loop for warmup
+
         # Set activation function.
         mlp_act = "relu"
         if cfg.recompute_activation:
@@ -90,7 +105,10 @@ class MGNTrainer:
             noise_std=0.01,
             hydrograph_ids_file="train.txt",
             split="train",
-            return_physics=self.use_physics_loss,
+            return_physics=self.use_physics_loss or self.use_local_physics_loss,
+            graph_type=cfg.get("graph_type", "knn"),
+            compute_boundary_mask=self.use_boundary_masking,
+            make_bidirectional=self.use_local_physics_loss,
         )
         sampler = DistributedSampler(
             dataset,
@@ -107,13 +125,44 @@ class MGNTrainer:
             num_workers=cfg.num_dataloader_workers,
             collate_fn=collate_fn,
         )
+        # Validation dataset and dataloader.
+        val_dataset = HydroGraphDataset(
+            name="hydrograph_dataset_val",
+            data_dir=cfg.data_dir,
+            prefix="M80",
+            num_samples=500,
+            n_time_steps=cfg.n_time_steps,
+            k=4,
+            noise_type=cfg.noise_type,
+            noise_std=0.0,
+            hydrograph_ids_file="val.txt",
+            split="val",
+            return_physics=self.use_physics_loss or self.use_local_physics_loss,
+            graph_type=cfg.get("graph_type", "knn"),
+            compute_boundary_mask=self.use_boundary_masking,
+            make_bidirectional=self.use_local_physics_loss,
+        )
+        val_sampler = DistributedSampler(
+            val_dataset,
+            shuffle=False,
+            drop_last=False,
+            num_replicas=self.dist.world_size,
+            rank=self.dist.rank,
+        )
+        self.val_dataloader = PyGDataLoader(
+            val_dataset,
+            batch_size=cfg.batch_size,
+            sampler=val_sampler,
+            pin_memory=True,
+            num_workers=cfg.num_dataloader_workers,
+            collate_fn=collate_fn,
+        )
         rank_zero_logger.info("Dataset and dataloader initialization complete.")
 
-        rank_zero_logger.info("Instantiating MeshGraphKAN model...")
-        self.model = MeshGraphKAN(
-            cfg.num_input_features,
-            cfg.num_edge_features,
-            cfg.num_output_features,
+        model_args = dict(
+            input_dim_nodes=cfg.num_input_features,
+            input_dim_edges=cfg.num_edge_features,
+            output_dim=cfg.num_output_features,
             processor_size=cfg.processor_size,
             mlp_activation_fn=mlp_act,
             num_layers_node_processor=cfg.num_layers_node_processor,
@@ -129,6 +178,14 @@ class MGNTrainer:
             recompute_activation=cfg.recompute_activation,
             num_harmonics=cfg.get("num_harmonics", 5),
         )
+        if self.use_local_physics_loss:
+            rank_zero_logger.info(
+                "Instantiating HydroGraphKANWithEdgeDecoder model..."
+            )
+            self.model = HydroGraphKANWithEdgeDecoder(**model_args)
+        else:
+            rank_zero_logger.info("Instantiating MeshGraphKAN model...")
+            self.model = MeshGraphKAN(**model_args)
         if cfg.jit:
             if not self.model.meta.jit:
                 raise ValueError("MeshGraphKAN is not yet JIT-compatible.")
@@ -154,7 +211,14 @@ class MGNTrainer:
             )
 
         self.model.train()
-        self.criterion = nn.MSELoss()
+        node_loss_type = cfg.get("node_loss_type", "mse")
+        if node_loss_type == "huber":
+            self.criterion = nn.HuberLoss(delta=cfg.get("huber_delta", 1.0))
+            rank_zero_logger.info(
+                f"Using HuberLoss with delta={cfg.get('huber_delta', 1.0)}"
+            )
+        else:
+            self.criterion = nn.MSELoss()
         try:
             if cfg.use_apex:
                 from apex.optimizers import FusedAdam
@@ -191,11 +255,20 @@ class MGNTrainer:
             f"Checkpoint loaded. Starting training from epoch {self.epoch_init}."
         )
 
+    def get_effective_local_weight(self):
+        """Get local loss weight with warmup schedule applied."""
+        if self.local_loss_warmup_epochs <= 0:
+            return self.local_physics_loss_weight
+        if self.current_epoch >= self.local_loss_warmup_epochs:
+            return self.local_physics_loss_weight
+        # Linear ramp from 0 to target weight over warmup epochs.
+        return self.local_physics_loss_weight * (self.current_epoch / self.local_loss_warmup_epochs)
+
     def train(self, batch):
-        if self.use_physics_loss:
+        if self.use_physics_loss or self.use_local_physics_loss:
             graph, physics_data = batch
         else:
-            graph = batch
+            graph = batch[0] if isinstance(batch, (tuple, list)) else batch
             physics_data = None
         graph = graph.to(self.dist.device)
         if physics_data is not None:
@@ -205,6 +278,13 @@ class MGNTrainer:
         self.backward(loss)
         self.scheduler.step()
         return loss, loss_dict
+
+    def _call_model(self, *args, **kwargs):
+        """Call model and unpack tuple return when edge decoder is active."""
+        out = self.model(*args, **kwargs)
+        if self.use_local_physics_loss:
+            return out  # (node_pred, edge_pred)
+        return out, None  # node_pred, None
 
     def forward(self, graph, physics_data):
         if self.noise_type == "pushforward":
@@ -221,7 +301,9 @@ class MGNTrainer:
                 X_one = torch.cat(
                     [static_part, water_depth_window_one, volume_window_one], dim=1
                 )
-                pred_one = self.model(X_one, graph.edge_attr, graph)
+                pred_one, edge_pred_one = self._call_model(
+                    X_one, graph.edge_attr, graph
+                )
                 one_step_loss = self.criterion(pred_one, graph.y)
 
                 # Stability branch (example implementation)
@@ -230,7 +312,7 @@ class MGNTrainer:
                 X_stab = torch.cat(
                     [static_part, water_depth_window_stab, volume_window_stab], dim=1
                 )
-                pred_stab = self.model(X_stab, graph.edge_attr, graph)
+                pred_stab, _ = self._call_model(X_stab, graph.edge_attr, graph)
                 pred_stab_detached = pred_stab.detach()
                 water_depth_updated = torch.cat(
                     [
@@ -249,7 +331,9 @@ class MGNTrainer:
                 X_stab_updated = torch.cat(
                     [static_part, water_depth_updated, volume_updated], dim=1
                 )
-                pred_stab2 = self.model(X_stab_updated, graph.edge_attr, graph)
+                pred_stab2, edge_pred_stab2 = self._call_model(
+                    X_stab_updated, graph.edge_attr, graph
+                )
                 stability_loss = self.criterion(pred_stab2, graph.y)
 
                 loss = one_step_loss + stability_loss
@@ -264,10 +348,35 @@ class MGNTrainer:
                     )
                     loss = loss + self.physics_loss_weight * phy_loss
                     loss_dict["physics_loss"] = phy_loss
+                if self.use_local_physics_loss and physics_data is not None:
+                    eff_weight = self.get_effective_local_weight()
+                    local_loss_one = compute_local_conservation_loss(
+                        pred_one, edge_pred_one, graph, physics_data,
+                        delta_t=self.delta_t,
+                        boundary_mask=graph.boundary_mask if self.use_boundary_masking and hasattr(graph, 'boundary_mask') else None,
+                        use_huber_residual=self.use_huber_residual,
+                        huber_beta=self.huber_beta,
+                    )
+                    local_loss_stab = compute_local_conservation_loss(
+                        pred_stab2, edge_pred_stab2, graph, physics_data,
+                        delta_t=self.delta_t,
+                        boundary_mask=graph.boundary_mask if self.use_boundary_masking and hasattr(graph, 'boundary_mask') else None,
+                        use_huber_residual=self.use_huber_residual,
+                        huber_beta=self.huber_beta,
+                    )
+                    local_loss = local_loss_one + local_loss_stab
+                    loss = loss + eff_weight * local_loss
+                    loss_dict["local_physics_loss"] = local_loss
+                    loss_dict["effective_local_weight"] = eff_weight
+                    edge_reg = compute_edge_regularization_loss(edge_pred_one, graph, use_smoothness=self.use_edge_smoothness)
+                    loss = loss + eff_weight * 0.1 * edge_reg
+                    loss_dict["edge_reg_loss"] = edge_reg
             return loss, loss_dict
         else:
             with autocast(device_type=self.dist.device.type, enabled=self.amp):
-                pred = self.model(graph.x, graph.edge_attr, graph)
+                pred, edge_pred = self._call_model(
+                    graph.x, graph.edge_attr, graph
+                )
                 mse_loss = self.criterion(pred, graph.y)
                 loss = mse_loss
                 loss_dict = {"total_loss": loss, "mse_loss": mse_loss}
@@ -277,7 +386,42 @@ class MGNTrainer:
                     )
                     loss = loss + self.physics_loss_weight * phy_loss
                     loss_dict["physics_loss"] = phy_loss
+                if self.use_local_physics_loss and physics_data is not None:
+                    eff_weight = self.get_effective_local_weight()
+                    local_loss = compute_local_conservation_loss(
+                        pred, edge_pred, graph, physics_data,
+                        delta_t=self.delta_t,
+                        boundary_mask=graph.boundary_mask if self.use_boundary_masking and hasattr(graph, 'boundary_mask') else None,
+                        use_huber_residual=self.use_huber_residual,
+                        huber_beta=self.huber_beta,
+                    )
+                    loss = loss + eff_weight * local_loss
+                    loss_dict["local_physics_loss"] = local_loss
+                    loss_dict["effective_local_weight"] = eff_weight
+                    edge_reg = compute_edge_regularization_loss(edge_pred, graph, use_smoothness=self.use_edge_smoothness)
+                    loss = loss + eff_weight * 0.1 * edge_reg
+                    loss_dict["edge_reg_loss"] = edge_reg
             return loss, loss_dict
+
+    @torch.no_grad()
+    def validate(self):
+        self.model.eval()
+        total_loss = 0.0
+        num_batches = 0
+        for batch in self.val_dataloader:
+            if self.use_physics_loss or self.use_local_physics_loss:
+                graph, physics_data = batch
+            else:
+                graph = batch[0] if isinstance(batch, (tuple, list)) else batch
+                physics_data = None
+            graph = graph.to(self.dist.device)
+            if physics_data is not None:
+                physics_data = {k: v.to(self.dist.device) for k, v in physics_data.items()}
+            loss, _ = self.forward(graph, physics_data)
+            total_loss += loss.item()
+            num_batches += 1
+        self.model.train()
+        return total_loss / num_batches if num_batches > 0 else float("inf")
 
     def backward(self, loss):
         if self.amp:
@@ -307,17 +451,39 @@ def main(cfg: DictConfig) -> None:
     trainer = MGNTrainer(cfg, rank_zero_logger)
     rank_zero_logger.info("Beginning training loop...")
     start_time = time.time()
+    train_losses = []
+    val_losses = []
 
     for epoch in range(trainer.epoch_init, cfg.epochs):
+        trainer.current_epoch = epoch
         epoch_loss = 0.0
+        epoch_components = {}
         num_batches = 0
         for batch in trainer.dataloader:
             loss, loss_dict = trainer.train(batch)
             epoch_loss += loss.detach().item()
+            for k, v in loss_dict.items():
+                if k == "effective_local_weight":
+                    epoch_components[k] = float(v)  # not accumulated, just last value
+                    continue
+                val = v.detach().item() if hasattr(v, 'item') else float(v)
+                epoch_components[k] = epoch_components.get(k, 0.0) + val
             num_batches += 1
 
         avg_loss = epoch_loss / num_batches if num_batches > 0 else float("inf")
-        rank_zero_logger.info(f"Epoch {epoch} completed. Average Loss: {avg_loss:.4e}")
+        val_loss = trainer.validate()
+        train_losses.append(avg_loss)
+        val_losses.append(val_loss)
+        components_str = " | ".join(
+            f"{k}: {v:.4e}" if k == "effective_local_weight" else f"{k}: {v / num_batches:.4e}"
+            for k, v in epoch_components.items()
+            if k != "total_loss"
+        )
+        rank_zero_logger.info(
+            f"Epoch {epoch} completed. Train Loss: {avg_loss:.4e} | Val Loss: {val_loss:.4e}"
+        )
+        if components_str:
+            rank_zero_logger.info(f"  Components: {components_str}")
 
         wandb.log(
             {
@@ -329,7 +495,13 @@ def main(cfg: DictConfig) -> None:
                 "physics_loss": loss_dict.get("physics_loss", torch.tensor(0.0))
                 .detach()
                 .cpu(),
+                "local_physics_loss": loss_dict.get(
+                    "local_physics_loss", torch.tensor(0.0)
+                )
+                .detach()
+                .cpu(),
                 "epoch": epoch,
+                "val_loss": val_loss,
             }
         )
 
@@ -351,6 +523,23 @@ def main(cfg: DictConfig) -> None:
         start_time = time.time()
 
     rank_zero_logger.info("Training completed successfully.")
+
+    # Save train/val loss curve
+    if dist.rank == 0 and train_losses:
+        epochs_range = list(range(trainer.epoch_init, trainer.epoch_init + len(train_losses)))
+        plt.figure(figsize=(10, 6))
+        plt.plot(epochs_range, train_losses, label="Train Loss")
+        plt.plot(epochs_range, val_losses, label="Val Loss")
+        plt.xlabel("Epoch")
+        plt.ylabel("Loss")
+        plt.title("Training and Validation Loss")
+        plt.legend()
+        plt.grid(True)
+        plt.yscale("log")
+        plot_path = os.path.join(to_absolute_path(cfg.ckpt_path), "loss_curve.png")
+        plt.savefig(plot_path, dpi=150, bbox_inches="tight")
+        plt.close()
+        rank_zero_logger.info(f"Loss curve saved to {plot_path}")
 
 
 if __name__ == "__main__":

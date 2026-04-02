@@ -31,9 +31,13 @@ The model checkpoint is loaded using the provided load_checkpoint utility.
 """
 
 import os
+import json
+import math
 import torch
 import hydra
 import networkx as nx
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 from omegaconf import DictConfig, OmegaConf
@@ -45,6 +49,8 @@ from physicsnemo.utils import load_checkpoint
 # Import the dataset and model.
 from physicsnemo.datapipes.gnn.hydrographnet_dataset import HydroGraphDataset
 from physicsnemo.models.meshgraphnet.meshgraphkan import MeshGraphKAN
+from model import HydroGraphKANWithEdgeDecoder
+from metrics import compute_rmse, compute_nse, compute_csi, compute_mass_balance_error
 
 # For converting PyG graph to networkx.
 from torch_geometric.utils import to_networkx
@@ -212,17 +218,27 @@ def main(cfg: DictConfig):
         split="test",
         rollout_length=rollout_length,
         return_physics=False,
+        graph_type=cfg.get("graph_type", "knn"),
+        make_bidirectional=cfg.get("use_local_physics_loss", False),
     )
     print(f"Loaded test dataset with {len(test_dataset)} hydrographs.")
+
+    # Extract denormalization statistics for physical-unit metrics.
+    wd_mean = test_dataset.dynamic_stats["water_depth"]["mean"]
+    wd_std = test_dataset.dynamic_stats["water_depth"]["std"]
+    vol_mean = test_dataset.dynamic_stats["volume"]["mean"]
+    vol_std = test_dataset.dynamic_stats["volume"]["std"]
+    eps = 1e-8
 
     # Instantiate the model.
     num_input_features = cfg.get("num_input_features", 16)
     num_edge_features = cfg.get("num_edge_features", 3)
     num_output_features = cfg.get("num_output_features", 2)
-    model = MeshGraphKAN(
-        num_input_features,
-        num_edge_features,
-        num_output_features,
+    use_local = cfg.get("use_local_physics_loss", False)
+    model_args = dict(
+        input_dim_nodes=num_input_features,
+        input_dim_edges=num_edge_features,
+        output_dim=num_output_features,
         processor_size=cfg.get("processor_size", 5),
         hidden_dim_processor=cfg.get("hidden_dim_processor", 64),
         hidden_dim_node_encoder=cfg.get("hidden_dim_node_encoder", 64),
@@ -234,6 +250,10 @@ def main(cfg: DictConfig):
         num_layers_node_decoder=cfg.get("num_layers_node_decoder", 1),
         num_harmonics=cfg.get("num_harmonics", 5),
     )
+    if use_local:
+        model = HydroGraphKANWithEdgeDecoder(**model_args)
+    else:
+        model = MeshGraphKAN(**model_args)
     model.to(device)
 
     # Load model checkpoint using the provided load_checkpoint utility.
@@ -248,7 +268,13 @@ def main(cfg: DictConfig):
     print(f"Checkpoint loaded from epoch {epoch_loaded}")
     model.eval()
 
+    # Metric collection across all hydrographs.
     all_rmse_all = []
+    all_nse_all = []
+    all_csi_005_all = []
+    all_csi_030_all = []
+    all_mbe_all = []
+    sample_ids = []
 
     # Loop over each test hydrograph.
     for idx in range(len(test_dataset)):
@@ -258,15 +284,19 @@ def main(cfg: DictConfig):
         X_current = g.x.to(device)  # Expected shape: [num_nodes, 16]
         num_nodes = X_current.size(0)
 
-        rollout_preds = []  # To store predicted actual water depth values for each step.
-        ground_truth_list = []  # To store ground truth water depth values.
-        rmse_list = []  # RMSE at each rollout step.
+        rollout_preds = []  # Predicted water depth (denormalized) for animation.
+        ground_truth_list = []  # Ground truth water depth (denormalized) for animation.
+        rmse_list = []
+        nse_list = []
+        csi_005_list = []
+        csi_030_list = []
+        mbe_list = []
 
         # Rollout data tensors.
-        # Note: inflow_seq is a 1D tensor of length rollout_length.
         inflow_seq = rollout_data["inflow"].to(device)
         precip_seq = rollout_data["precipitation"].to(device)
         wd_gt_seq = rollout_data["water_depth_gt"].to(device)
+        vol_gt_seq = rollout_data["volume_gt"].to(device)
 
         X_iter = X_current.clone()
 
@@ -288,7 +318,8 @@ def main(cfg: DictConfig):
             )  # shape remains 16
 
             # Predict the differences (delta).
-            pred = model(X_input, edge_features, g)  # shape: (num_nodes, 2)
+            out = model(X_input, edge_features, g)
+            pred = out[0] if isinstance(out, tuple) else out  # shape: (num_nodes, 2)
             new_wd = water_depth_window[:, -1:] + pred[:, 0:1]
             new_vol = volume_window[:, -1:] + pred[:, 1:2]
 
@@ -308,46 +339,137 @@ def main(cfg: DictConfig):
                 [static_part_updated, water_depth_updated, volume_updated], dim=1
             )
 
-            # Save the predicted actual water depth.
-            rollout_preds.append(new_wd.squeeze(1).detach().cpu())
-            ground_truth_list.append(wd_gt_seq[t].detach().cpu())
+            # Denormalize to physical units for metrics.
+            pred_wd_real = new_wd.squeeze(1) * (wd_std + eps) + wd_mean
+            gt_wd_real = wd_gt_seq[t] * (wd_std + eps) + wd_mean
+            pred_vol_real = new_vol.squeeze(1) * (vol_std + eps) + vol_mean
+            gt_vol_real = vol_gt_seq[t] * (vol_std + eps) + vol_mean
 
-            # Compute RMSE for this rollout step.
-            rmse = torch.sqrt(
-                torch.mean((new_wd.squeeze(1) - wd_gt_seq[t]) ** 2)
-            ).item()
-            rmse_list.append(rmse)
+            # Store denormalized values for animation.
+            rollout_preds.append(pred_wd_real.detach().cpu())
+            ground_truth_list.append(gt_wd_real.detach().cpu())
 
+            # Compute all metrics on denormalized values.
+            rmse_list.append(compute_rmse(pred_wd_real, gt_wd_real))
+            nse_list.append(compute_nse(pred_wd_real, gt_wd_real))
+            csi_005_list.append(compute_csi(pred_wd_real, gt_wd_real, 0.05))
+            csi_030_list.append(compute_csi(pred_wd_real, gt_wd_real, 0.30))
+            mbe_list.append(compute_mass_balance_error(pred_vol_real, gt_vol_real))
+
+        # Aggregate per-hydrograph.
         all_rmse_all.append(rmse_list)
-        mean_rmse_sample = sum(rmse_list) / len(rmse_list)
+        all_nse_all.append(nse_list)
+        all_csi_005_all.append(csi_005_list)
+        all_csi_030_all.append(csi_030_list)
+        all_mbe_all.append(mbe_list)
+
         sample_id = test_dataset.dynamic_data[idx].get("hydro_id", idx)
-        print(f"Hydrograph {sample_id}: Mean RMSE = {mean_rmse_sample:.4f}")
+        sample_ids.append(str(sample_id))
+
+        mean_rmse = sum(rmse_list) / len(rmse_list)
+        mean_nse = sum(nse_list) / len(nse_list)
+        valid_csi_005 = [x for x in csi_005_list if not math.isnan(x)]
+        valid_csi_030 = [x for x in csi_030_list if not math.isnan(x)]
+        mean_csi_005 = sum(valid_csi_005) / len(valid_csi_005) if valid_csi_005 else float("nan")
+        mean_csi_030 = sum(valid_csi_030) / len(valid_csi_030) if valid_csi_030 else float("nan")
+        mean_mbe = sum(mbe_list) / len(mbe_list)
+
+        print(
+            f"Hydrograph {sample_id}: "
+            f"RMSE={mean_rmse:.4f}m | NSE={mean_nse:.4f} | "
+            f"CSI@0.05={mean_csi_005:.4f} | CSI@0.3={mean_csi_030:.4f} | "
+            f"MBE={mean_mbe:.6f}"
+        )
 
         anim_filename = os.path.join(anim_output_dir, f"animation_{sample_id}.gif")
         create_animation(rollout_preds, ground_truth_list, g, rmse_list, anim_filename)
 
+    # ---- Overall metrics aggregation ----
     all_rmse_tensor = torch.tensor(all_rmse_all)
-    overall_mean_rmse = torch.mean(all_rmse_tensor, dim=0)
-    overall_std_rmse = torch.std(all_rmse_tensor, dim=0)
-    print("Overall Mean RMSE over rollout steps:", overall_mean_rmse)
-    print("Overall Std RMSE over rollout steps:", overall_std_rmse)
+    all_nse_tensor = torch.tensor(all_nse_all)
+    all_csi_005_tensor = torch.tensor(all_csi_005_all)
+    all_csi_030_tensor = torch.tensor(all_csi_030_all)
+    all_mbe_tensor = torch.tensor(all_mbe_all)
 
+    # Per-step averages across hydrographs.
+    mean_rmse_per_step = all_rmse_tensor.mean(dim=0)
+    std_rmse_per_step = all_rmse_tensor.std(dim=0)
+    mean_nse_per_step = all_nse_tensor.mean(dim=0)
+    mean_csi_005_per_step = torch.nanmean(all_csi_005_tensor, dim=0)
+    mean_csi_030_per_step = torch.nanmean(all_csi_030_tensor, dim=0)
+    mean_mbe_per_step = all_mbe_tensor.mean(dim=0)
+
+    print("\n===== Overall Metrics (mean +/- std across hydrographs) =====")
+    print(f"RMSE:     {all_rmse_tensor.mean():.4f} +/- {all_rmse_tensor.std():.4f} m")
+    print(f"NSE:      {all_nse_tensor.mean():.4f} +/- {all_nse_tensor.std():.4f}")
+    print(f"CSI@0.05: {torch.nanmean(all_csi_005_tensor):.4f} +/- {all_csi_005_tensor[~all_csi_005_tensor.isnan()].std():.4f}")
+    print(f"CSI@0.3:  {torch.nanmean(all_csi_030_tensor):.4f} +/- {all_csi_030_tensor[~all_csi_030_tensor.isnan()].std():.4f}")
+    print(f"MBE:      {all_mbe_tensor.mean():.6f} +/- {all_mbe_tensor.std():.6f}")
+
+    print("\nMean RMSE per rollout step:", mean_rmse_per_step.tolist())
+    print("Std RMSE per rollout step:", std_rmse_per_step.tolist())
+
+    # Save all metrics to JSON.
+    metrics_output = {
+        "config": {
+            "use_local_physics_loss": use_local,
+            "rollout_length": rollout_length,
+            "num_hydrographs": len(test_dataset),
+            "ckpt_path": str(ckpt_path),
+        },
+        "per_step": {
+            "rmse_mean": mean_rmse_per_step.tolist(),
+            "rmse_std": std_rmse_per_step.tolist(),
+            "nse_mean": mean_nse_per_step.tolist(),
+            "csi_005_mean": mean_csi_005_per_step.tolist(),
+            "csi_030_mean": mean_csi_030_per_step.tolist(),
+            "mbe_mean": mean_mbe_per_step.tolist(),
+        },
+        "per_hydrograph": {
+            sample_ids[i]: {
+                "mean_rmse": float(all_rmse_tensor[i].mean()),
+                "mean_nse": float(all_nse_tensor[i].mean()),
+                "mean_csi_005": float(torch.nanmean(all_csi_005_tensor[i])),
+                "mean_csi_030": float(torch.nanmean(all_csi_030_tensor[i])),
+                "mean_mbe": float(all_mbe_tensor[i].mean()),
+            }
+            for i in range(len(test_dataset))
+        },
+        "overall": {
+            "rmse_mean": float(all_rmse_tensor.mean()),
+            "rmse_std": float(all_rmse_tensor.std()),
+            "nse_mean": float(all_nse_tensor.mean()),
+            "nse_std": float(all_nse_tensor.std()),
+            "csi_005_mean": float(torch.nanmean(all_csi_005_tensor)),
+            "csi_030_mean": float(torch.nanmean(all_csi_030_tensor)),
+            "mbe_mean": float(all_mbe_tensor.mean()),
+        },
+    }
+    metrics_path = os.path.join(anim_output_dir, "metrics.json")
+    with open(metrics_path, "w") as f:
+        json.dump(metrics_output, f, indent=2)
+    print(f"\nMetrics saved to {metrics_path}")
+
+    # Plot RMSE curve with error bands.
     timesteps = [(i + 1) * (20 / 60) for i in range(rollout_length)]
     plt.figure(figsize=(10, 6))
-    plt.plot(timesteps, overall_mean_rmse.numpy(), label="Mean RMSE", linewidth=3)
+    plt.plot(timesteps, mean_rmse_per_step.numpy(), label="Mean RMSE", linewidth=3)
     plt.fill_between(
         timesteps,
-        (overall_mean_rmse - overall_std_rmse).numpy(),
-        (overall_mean_rmse + overall_std_rmse).numpy(),
+        (mean_rmse_per_step - std_rmse_per_step).numpy(),
+        (mean_rmse_per_step + std_rmse_per_step).numpy(),
         alpha=0.3,
-        label="± Std",
+        label="\u00b1 Std",
     )
     plt.xlabel("Time (Hours)", fontsize=20)
-    plt.ylabel("RMSE (Water Depth)", fontsize=20)
+    plt.ylabel("RMSE (m)", fontsize=20)
     plt.title("Overall RMSE Curve Over Rollout", fontsize=24)
     plt.legend(fontsize=16)
     plt.grid(True)
-    plt.show()
+    plot_path = os.path.join(anim_output_dir, "rmse_curve.png")
+    plt.savefig(plot_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"RMSE plot saved to {plot_path}")
 
 
 if __name__ == "__main__":

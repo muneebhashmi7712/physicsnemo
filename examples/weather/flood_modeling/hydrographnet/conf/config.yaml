@@ -60,6 +60,20 @@ use_physics_loss: true
 delta_t: 1200.0
 physics_loss_weight: 1.0
 
+# Local conservation loss settings (DualFloodGNN-inspired).
+use_local_physics_loss: true
+local_physics_loss_weight: 0.1
+use_edge_smoothness: true
+local_loss_warmup_epochs: 0    # 0 = no warmup; >0 = linear ramp from 0 to target weight over N epochs
+use_boundary_masking: false    # Exclude convex hull nodes from local conservation loss
+use_huber_residual: false      # Use smooth_l1 instead of L1 for conservation residual
+huber_beta: 0.5               # Beta (transition point) for smooth_l1_loss; only used if use_huber_residual=true
+graph_type: knn                # "knn" (default) or "delaunay"
+
+# Node loss type.
+node_loss_type: "mse"          # "mse" or "huber"
+huber_delta: 1.0               # Delta for HuberLoss (only used if node_loss_type=huber)
+
 # Performance and optimization configurations.
 use_apex: True            # Use NVIDIA Apex for mixed precision if available.
 amp: False                # Automatic mixed precision flag.
@@ -78,4 +92,4 @@ ckpt_path: /home/woody/iwi5/iwi5416h/hydrographnet/outputs/checkpoints
 
 # Test and visualization configuration.
 num_test_samples: 25
-num_test_time_steps: 30
+num_test_time_steps: 45

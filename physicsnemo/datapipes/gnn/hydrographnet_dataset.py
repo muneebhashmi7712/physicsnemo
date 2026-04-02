@@ -311,9 +311,12 @@ class HydroGraphDataset(Dataset):
         split: str = "train",
         rollout_length: Optional[int] = None,
         return_physics: bool = False,
+        graph_type: str = "knn",
+        compute_boundary_mask: bool = False,
+        make_bidirectional: bool = False,
     ):
-        if split not in {"train", "test"}:
-            raise ValueError(f"Invalid split '{split}'. Expected 'train' or 'test'.")
+        if split not in {"train", "val", "test"}:
+            raise ValueError(f"Invalid split '{split}'. Expected 'train', 'val', or 'test'.")
 
         # Initialize dataset attributes.
         self.data_dir = str(data_dir)
@@ -329,6 +332,9 @@ class HydroGraphDataset(Dataset):
         # rollout_length is only used when split=="test"
         self.rollout_length = rollout_length if rollout_length is not None else 0
         self.return_physics = return_physics
+        self.graph_type = graph_type
+        self.compute_boundary_mask = compute_boundary_mask
+        self.make_bidirectional = make_bidirectional
 
         # Placeholders for static and dynamic data, indices, and normalization stats.
         self.static_data = {}
@@ -363,7 +369,7 @@ class HydroGraphDataset(Dataset):
             )
             self.save_norm_stats(self.static_stats, STATIC_NORM_STATS_FILE)
         else:
-            # For test or validation, load precomputed normalization stats.
+            # For val or test, load precomputed normalization stats.
             self.static_stats = self.load_norm_stats(STATIC_NORM_STATS_FILE)
             (
                 xy_coords,
@@ -381,13 +387,42 @@ class HydroGraphDataset(Dataset):
                 self.data_dir, self.prefix, norm_stats_static=self.static_stats
             )
 
-        # Build the graph connectivity using a k-d tree.
+        # Build the graph connectivity.
         num_nodes = xy_coords.shape[0]
-        kdtree = scipy_spatial.KDTree(xy_coords)
-        _, neighbors = kdtree.query(xy_coords, k=self.k + 1)
-        edge_index = np.vstack(
-            [(i, nbr) for i, nbrs in enumerate(neighbors) for nbr in nbrs if nbr != i]
-        ).T
+        if self.graph_type == "delaunay":
+            # Delaunay triangulation: edges represent natural cell boundaries.
+            tri = scipy_spatial.Delaunay(xy_coords)
+            edges_set = set()
+            for simplex in tri.simplices:
+                for i in range(3):
+                    for j in range(i + 1, 3):
+                        a, b = simplex[i], simplex[j]
+                        edges_set.add((a, b))
+                        edges_set.add((b, a))  # bidirectional
+            edge_index = np.array(sorted(edges_set)).T
+        else:
+            # KNN graph (default): proximity-based connectivity.
+            kdtree = scipy_spatial.KDTree(xy_coords)
+            _, neighbors = kdtree.query(xy_coords, k=self.k + 1)
+            edge_index = np.vstack(
+                [(i, nbr) for i, nbrs in enumerate(neighbors) for nbr in nbrs if nbr != i]
+            ).T
+            # Optionally make graph bidirectional (needed for local conservation loss).
+            if self.make_bidirectional:
+                edge_index_rev = edge_index[[1, 0], :]
+                edge_index = np.unique(
+                    np.hstack([edge_index, edge_index_rev]), axis=1
+                )
+
+        # Compute boundary mask if requested (convex hull nodes).
+        self.boundary_node_indices = None
+        if self.compute_boundary_mask:
+            hull = scipy_spatial.ConvexHull(xy_coords)
+            self.boundary_node_indices = set(hull.vertices)
+            logger.info(
+                f"Boundary masking: {len(self.boundary_node_indices)} of {num_nodes} nodes on convex hull"
+            )
+
         edge_features = self.create_edge_features(xy_coords, edge_index)
 
         # Store static data.
@@ -511,8 +546,8 @@ class HydroGraphDataset(Dataset):
             }
             self.dynamic_data.append(dyn_std)
 
-        # Build sample indices for training (sliding window) or validate test data.
-        if self.split == "train":
+        # Build sample indices for training/val (sliding window) or test (rollout).
+        if self.split in {"train", "val"}:
             for h_idx, dyn in enumerate(self.dynamic_data):
                 T = dyn["water_depth"].shape[0]
                 if self.noise_type == "pushforward":
@@ -592,6 +627,15 @@ class HydroGraphDataset(Dataset):
             g.x = torch.tensor(node_features, dtype=torch.float)
             g.y = torch.tensor(target, dtype=torch.float)
 
+            # Add boundary mask if computed.
+            if self.boundary_node_indices is not None:
+                num_n = node_features.shape[0]
+                bmask = torch.zeros(num_n, dtype=torch.bool)
+                for bi in self.boundary_node_indices:
+                    if bi < num_n:
+                        bmask[bi] = True
+                g.boundary_mask = bmask
+
             # Determine if physics data should be returned.
             need_physics = self.return_physics or (self.noise_type == "pushforward")
             if need_physics:
@@ -667,6 +711,10 @@ class HydroGraphDataset(Dataset):
                     "precip_std": float(self.dynamic_stats["precipitation"]["std"]),
                     "num_nodes": float(sd["xy_coords"].shape[0]),
                     "area_sum": float(np.sum(sd["area_denorm"])),
+                    "area_mean": float(self.static_stats["area"]["mean"][0]),
+                    "area_std": float(self.static_stats["area"]["std"][0]),
+                    "infiltration_mean": float(self.static_stats["infiltration"]["mean"][0]),
+                    "infiltration_std": float(self.static_stats["infiltration"]["std"][0]),
                     "infiltration_area_sum": float(
                         np.sum(
                             self.denormalize(
