@@ -204,6 +204,7 @@ def main(cfg: DictConfig):
     data_dir = cfg.get("test_dir")
     test_ids_file = cfg.get("test_ids_file", "test.txt")
     ckpt_path = cfg.get("ckpt_path")
+    ckpt_epoch = cfg.get("ckpt_epoch", None)  # specific epoch index to load; None = latest
     anim_output_dir = cfg.get("animation_output_dir", "animations")
     os.makedirs(anim_output_dir, exist_ok=True)
 
@@ -235,6 +236,7 @@ def main(cfg: DictConfig):
     num_edge_features = cfg.get("num_edge_features", 3)
     num_output_features = cfg.get("num_output_features", 2)
     use_local = cfg.get("use_local_physics_loss", False)
+    _lp_cfg = cfg.get("lowpass", {}) or {}
     model_args = dict(
         input_dim_nodes=num_input_features,
         input_dim_edges=num_edge_features,
@@ -249,23 +251,53 @@ def main(cfg: DictConfig):
         num_layers_edge_encoder=cfg.get("num_layers_edge_encoder", 1),
         num_layers_node_decoder=cfg.get("num_layers_node_decoder", 1),
         num_harmonics=cfg.get("num_harmonics", 5),
+        lowpass_enabled=bool(_lp_cfg.get("enabled", False)),
+        lowpass_iterations=int(_lp_cfg.get("iterations", 1)),
+        lowpass_alpha_init=float(_lp_cfg.get("alpha_init", 0.2)),
+        lowpass_learnable_alpha=bool(_lp_cfg.get("learnable_alpha", False)),
+        lowpass_alpha_per_channel=bool(_lp_cfg.get("alpha_per_channel", False)),
     )
     if use_local:
         model = HydroGraphKANWithEdgeDecoder(**model_args)
     else:
-        model = MeshGraphKAN(**model_args)
+        base_args = {k: v for k, v in model_args.items() if not k.startswith("lowpass_")}
+        model = MeshGraphKAN(**base_args)
     model.to(device)
 
-    # Load model checkpoint using the provided load_checkpoint utility.
-    epoch_loaded = load_checkpoint(
-        to_absolute_path(ckpt_path),
-        models=model,
-        optimizer=None,
-        scheduler=None,
-        scaler=None,
-        device=device,
-    )
-    print(f"Checkpoint loaded from epoch {epoch_loaded}")
+    # Load model checkpoint.
+    # If ckpt_epoch is specified, load that exact epoch directly (epoch sweep mode).
+    # Otherwise prefer best_checkpoint.pt, then fall back to the latest checkpoint.
+    if ckpt_epoch is not None:
+        print(f"Loading checkpoint for epoch {ckpt_epoch} (epoch sweep mode).")
+        epoch_loaded = load_checkpoint(
+            to_absolute_path(ckpt_path),
+            models=model,
+            optimizer=None,
+            scheduler=None,
+            scaler=None,
+            epoch=ckpt_epoch,
+            device=device,
+        )
+        print(f"Checkpoint loaded from epoch {epoch_loaded}")
+    else:
+        best_ckpt_file = os.path.join(to_absolute_path(ckpt_path), "best_checkpoint.pt")
+        if os.path.exists(best_ckpt_file):
+            best_ckpt = torch.load(best_ckpt_file, map_location=device)
+            model.load_state_dict(best_ckpt["model_state_dict"])
+            epoch_loaded = best_ckpt.get("epoch", 0)
+            val_loss = best_ckpt.get("val_loss", float("nan"))
+            print(f"Loaded best checkpoint from epoch {epoch_loaded} (val_loss={val_loss:.4e})")
+        else:
+            print("No best_checkpoint.pt found, falling back to latest checkpoint.")
+            epoch_loaded = load_checkpoint(
+                to_absolute_path(ckpt_path),
+                models=model,
+                optimizer=None,
+                scheduler=None,
+                scaler=None,
+                device=device,
+            )
+            print(f"Checkpoint loaded from epoch {epoch_loaded}")
     model.eval()
 
     # Metric collection across all hydrographs.
@@ -381,8 +413,8 @@ def main(cfg: DictConfig):
             f"MBE={mean_mbe:.6f}"
         )
 
-        anim_filename = os.path.join(anim_output_dir, f"animation_{sample_id}.gif")
-        create_animation(rollout_preds, ground_truth_list, g, rmse_list, anim_filename)
+        # anim_filename = os.path.join(anim_output_dir, f"animation_{sample_id}.gif")
+        # create_animation(rollout_preds, ground_truth_list, g, rmse_list, anim_filename)
 
     # ---- Overall metrics aggregation ----
     all_rmse_tensor = torch.tensor(all_rmse_all)
@@ -416,6 +448,7 @@ def main(cfg: DictConfig):
             "rollout_length": rollout_length,
             "num_hydrographs": len(test_dataset),
             "ckpt_path": str(ckpt_path),
+            "epoch_loaded": epoch_loaded,
         },
         "per_step": {
             "rmse_mean": mean_rmse_per_step.tolist(),

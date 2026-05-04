@@ -17,12 +17,83 @@
 from typing import Literal, Tuple, Union
 
 import torch
+import torch.nn as nn
 from jaxtyping import Float
+from torch_geometric.utils import add_self_loops, to_undirected
 
 from physicsnemo.models.meshgraphnet.meshgraphkan import MeshGraphKAN
 from physicsnemo.nn import get_activation
 from physicsnemo.nn.module.gnn_layers.graph_types import GraphType
 from physicsnemo.nn.module.gnn_layers.mesh_graph_mlp import MeshGraphMLP
+
+
+class GraphLowPassFilter(nn.Module):
+    """Symmetric-normalized adjacency low-pass filter on node features.
+
+    Applies h' = (1 - alpha) * h + alpha * (A_norm)^K @ h
+    where A_norm = D_hat^{-1/2} (A_sym + I) D_hat^{-1/2}, A_sym is the
+    symmetrized edge_index (KNN graphs are directed), and D_hat counts
+    self-loops. K iterations are applied as repeated sparse mat-vecs.
+
+    alpha is parameterized via a sigmoid for stable [0,1] confinement.
+    When learnable_alpha=False, raw_alpha is stored as a non-persistent
+    buffer so state_dict keys remain identical to baseline runs.
+    """
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        num_iterations: int = 1,
+        alpha_init: float = 0.2,
+        learnable_alpha: bool = False,
+        alpha_per_channel: bool = False,
+    ):
+        super().__init__()
+        self.num_iterations = int(num_iterations)
+        self.learnable_alpha = bool(learnable_alpha)
+        self.alpha_per_channel = bool(alpha_per_channel)
+        shape = (hidden_dim,) if alpha_per_channel else ()
+
+        eps = 1e-6
+        a = max(min(float(alpha_init), 1.0 - eps), eps)
+        raw_init = float(torch.log(torch.tensor(a / (1.0 - a))).item())
+        init_tensor = torch.full(shape, raw_init)
+
+        if learnable_alpha:
+            self.raw_alpha = nn.Parameter(init_tensor)
+        else:
+            self.register_buffer("raw_alpha", init_tensor, persistent=False)
+
+    @property
+    def alpha(self) -> torch.Tensor:
+        return torch.sigmoid(self.raw_alpha)
+
+    def forward(self, h: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
+        if self.num_iterations <= 0:
+            return h
+        num_nodes = h.size(0)
+
+        ei = to_undirected(edge_index, num_nodes=num_nodes)
+        ei, _ = add_self_loops(ei, num_nodes=num_nodes)
+        src, dst = ei[0], ei[1]
+
+        deg = torch.zeros(num_nodes, device=h.device, dtype=h.dtype)
+        ones = torch.ones(src.size(0), device=h.device, dtype=h.dtype)
+        deg.scatter_add_(0, src, ones)
+        deg_inv_sqrt = deg.clamp(min=1.0).rsqrt()
+        edge_weight = deg_inv_sqrt[src] * deg_inv_sqrt[dst]
+
+        smoothed = h
+        for _ in range(self.num_iterations):
+            msg = smoothed[src] * edge_weight.unsqueeze(-1)
+            agg = torch.zeros_like(smoothed)
+            agg.scatter_add_(0, dst.unsqueeze(-1).expand_as(msg), msg)
+            smoothed = agg
+
+        a = self.alpha.to(h.dtype)
+        if a.dim() == 0:
+            return (1.0 - a) * h + a * smoothed
+        return (1.0 - a).unsqueeze(0) * h + a.unsqueeze(0) * smoothed
 
 
 class HydroGraphKANWithEdgeDecoder(MeshGraphKAN):
@@ -55,6 +126,11 @@ class HydroGraphKANWithEdgeDecoder(MeshGraphKAN):
         checkpoint_offloading: bool = False,
         recompute_activation: bool = False,
         num_harmonics: int = 5,
+        lowpass_enabled: bool = False,
+        lowpass_iterations: int = 1,
+        lowpass_alpha_init: float = 0.2,
+        lowpass_learnable_alpha: bool = False,
+        lowpass_alpha_per_channel: bool = False,
     ):
         super().__init__(
             input_dim_nodes=input_dim_nodes,
@@ -91,6 +167,17 @@ class HydroGraphKANWithEdgeDecoder(MeshGraphKAN):
             recompute_activation=recompute_activation,
         )
 
+        if lowpass_enabled:
+            self.lowpass = GraphLowPassFilter(
+                hidden_dim=hidden_dim_processor,
+                num_iterations=lowpass_iterations,
+                alpha_init=lowpass_alpha_init,
+                learnable_alpha=lowpass_learnable_alpha,
+                alpha_per_channel=lowpass_alpha_per_channel,
+            )
+        else:
+            self.lowpass = None
+
     def forward(
         self,
         node_features: Float[torch.Tensor, "num_nodes input_dim_nodes"],
@@ -104,6 +191,9 @@ class HydroGraphKANWithEdgeDecoder(MeshGraphKAN):
         # Encode
         edge_features = self.edge_encoder(edge_features)
         node_features = self.node_encoder(node_features)
+
+        if self.lowpass is not None:
+            node_features = self.lowpass(node_features, graph.edge_index)
 
         # Process — replicate processor.forward() to capture both node and edge embeddings
         with self.processor.checkpoint_offload_ctx:

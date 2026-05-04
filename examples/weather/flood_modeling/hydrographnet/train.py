@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import time
 import os
 
@@ -78,11 +79,22 @@ class MGNTrainer:
         self.use_local_physics_loss = cfg.get("use_local_physics_loss", False)
         self.local_physics_loss_weight = cfg.get("local_physics_loss_weight", 0.1)
         self.use_edge_smoothness = cfg.get("use_edge_smoothness", True)
+        self.use_antisymmetry = cfg.get("use_antisymmetry", True)
         self.local_loss_warmup_epochs = cfg.get("local_loss_warmup_epochs", 0)
         self.use_boundary_masking = cfg.get("use_boundary_masking", False)
         self.use_huber_residual = cfg.get("use_huber_residual", False)
         self.huber_beta = cfg.get("huber_beta", 0.5)
         self.current_epoch = 0  # updated by training loop for warmup
+
+        # Lookahead conservation gating: roll back if conservation update degrades MSE.
+        self.use_lookahead_gating = cfg.get("use_lookahead_gating", False)
+        self.lookahead_tolerance = cfg.get("lookahead_tolerance", 0.0)
+
+        # Conservation weight decay schedule: linearly reduce conservation influence over time.
+        self.use_cons_weight_decay = cfg.get("use_cons_weight_decay", False)
+        self.cons_weight_decay_start_epoch = cfg.get("cons_weight_decay_start_epoch", 20)
+        self.cons_weight_decay_length = cfg.get("cons_weight_decay_length", 30)
+        self.cons_weight_decay_floor = cfg.get("cons_weight_decay_floor", 0.0)
 
         # Set activation function.
         mlp_act = "relu"
@@ -159,6 +171,7 @@ class MGNTrainer:
         )
         rank_zero_logger.info("Dataset and dataloader initialization complete.")
 
+        lowpass_cfg = cfg.get("lowpass", {}) or {}
         model_args = dict(
             input_dim_nodes=cfg.num_input_features,
             input_dim_edges=cfg.num_edge_features,
@@ -177,6 +190,11 @@ class MGNTrainer:
             num_processor_checkpoint_segments=cfg.num_processor_checkpoint_segments,
             recompute_activation=cfg.recompute_activation,
             num_harmonics=cfg.get("num_harmonics", 5),
+            lowpass_enabled=bool(lowpass_cfg.get("enabled", False)),
+            lowpass_iterations=int(lowpass_cfg.get("iterations", 1)),
+            lowpass_alpha_init=float(lowpass_cfg.get("alpha_init", 0.2)),
+            lowpass_learnable_alpha=bool(lowpass_cfg.get("learnable_alpha", False)),
+            lowpass_alpha_per_channel=bool(lowpass_cfg.get("alpha_per_channel", False)),
         )
         if self.use_local_physics_loss:
             rank_zero_logger.info(
@@ -185,7 +203,8 @@ class MGNTrainer:
             self.model = HydroGraphKANWithEdgeDecoder(**model_args)
         else:
             rank_zero_logger.info("Instantiating MeshGraphKAN model...")
-            self.model = MeshGraphKAN(**model_args)
+            base_args = {k: v for k, v in model_args.items() if not k.startswith("lowpass_")}
+            self.model = MeshGraphKAN(**base_args)
         if cfg.jit:
             if not self.model.meta.jit:
                 raise ValueError("MeshGraphKAN is not yet JIT-compatible.")
@@ -256,13 +275,17 @@ class MGNTrainer:
         )
 
     def get_effective_local_weight(self):
-        """Get local loss weight with warmup schedule applied."""
-        if self.local_loss_warmup_epochs <= 0:
-            return self.local_physics_loss_weight
-        if self.current_epoch >= self.local_loss_warmup_epochs:
-            return self.local_physics_loss_weight
-        # Linear ramp from 0 to target weight over warmup epochs.
-        return self.local_physics_loss_weight * (self.current_epoch / self.local_loss_warmup_epochs)
+        """Get local loss weight with warmup and optional decay schedule applied."""
+        # Warmup phase: linear ramp from 0 to target weight.
+        if self.local_loss_warmup_epochs > 0 and self.current_epoch < self.local_loss_warmup_epochs:
+            return self.local_physics_loss_weight * (self.current_epoch / self.local_loss_warmup_epochs)
+        w = self.local_physics_loss_weight
+        # Decay phase: linearly reduce weight toward floor after decay_start_epoch.
+        if self.use_cons_weight_decay and self.current_epoch >= self.cons_weight_decay_start_epoch:
+            progress = min(1.0, (self.current_epoch - self.cons_weight_decay_start_epoch) / max(1, self.cons_weight_decay_length))
+            floor_ratio = self.cons_weight_decay_floor / w if w > 0 else 0.0
+            w = w * (floor_ratio + (1.0 - floor_ratio) * (1.0 - progress))
+        return w
 
     def train(self, batch):
         if self.use_physics_loss or self.use_local_physics_loss:
@@ -273,10 +296,78 @@ class MGNTrainer:
         graph = graph.to(self.dist.device)
         if physics_data is not None:
             physics_data = {k: v.to(self.dist.device) for k, v in physics_data.items()}
+        if self.use_lookahead_gating and self.use_local_physics_loss:
+            return self._train_with_lookahead(graph, physics_data)
         self.optimizer.zero_grad()
         loss, loss_dict = self.forward(graph, physics_data)
         self.backward(loss)
         self.scheduler.step()
+        return loss, loss_dict
+
+    def _train_with_lookahead(self, graph, physics_data):
+        """Training step with lookahead validation.
+
+        Performs the full (MSE + conservation) update tentatively, then checks
+        whether the MSE component worsened on the same batch.  If it did (by
+        more than ``lookahead_tolerance``), the model weights are restored and
+        a clean MSE-only update is applied instead.  The conservation gradient
+        is therefore only accepted when it does not hurt nodal accuracy.
+        """
+        self.optimizer.zero_grad()
+        loss, loss_dict = self.forward(graph, physics_data)
+
+        eff_weight = loss_dict.get("effective_local_weight", 0.0)
+
+        # If conservation is inactive (warmup / decay to zero), skip lookahead.
+        if eff_weight <= 0:
+            self.backward(loss)
+            self.scheduler.step()
+            loss_dict["lookahead_rollback"] = 0.0
+            return loss, loss_dict
+
+        # MSE component before the tentative step (no extra forward pass needed).
+        if "loss_one" in loss_dict:
+            mse_before = (loss_dict["loss_one"] + loss_dict["loss_stability"]).item()
+        else:
+            mse_before = loss_dict.get("mse_loss", loss_dict["total_loss"]).item()
+
+        # Save model weights, optimizer state, and scaler state before the tentative step.
+        # All three must be restored together on rollback: restoring only model weights leaves
+        # Adam's moment estimates (exp_avg, exp_avg_sq) and step counter reflecting the
+        # rejected conservation gradient, which would leak ~9% of that gradient into the
+        # replacement MSE-only step via the first-moment EMA (β1=0.9).
+        saved_weights = {k: v.cpu().clone() for k, v in self.model.state_dict().items()}
+        saved_opt_state = copy.deepcopy(self.optimizer.state_dict())
+        saved_scaler_state = copy.deepcopy(self.scaler.state_dict()) if self.amp else None
+
+        # Tentative full step (MSE + conservation).
+        self.backward(loss)
+
+        # Re-evaluate MSE on the same batch with conservation skipped.
+        with torch.no_grad():
+            _, after_dict = self.forward(graph, physics_data, _cons_weight_override=0.0)
+        if "loss_one" in after_dict:
+            mse_after = (after_dict["loss_one"] + after_dict["loss_stability"]).item()
+        else:
+            mse_after = after_dict.get("mse_loss", after_dict["total_loss"]).item()
+
+        rolled_back = False
+        if mse_after > mse_before * (1.0 + self.lookahead_tolerance):
+            # MSE degraded — restore model weights, optimizer state, and scaler state,
+            # then redo with MSE-only loss so the accepted step is clean.
+            self.model.load_state_dict(
+                {k: v.to(self.dist.device) for k, v in saved_weights.items()}
+            )
+            self.optimizer.load_state_dict(saved_opt_state)
+            if self.amp and saved_scaler_state is not None:
+                self.scaler.load_state_dict(saved_scaler_state)
+            self.optimizer.zero_grad()
+            mse_only_loss, _ = self.forward(graph, physics_data, _cons_weight_override=0.0)
+            self.backward(mse_only_loss)
+            rolled_back = True
+
+        self.scheduler.step()
+        loss_dict["lookahead_rollback"] = 1.0 if rolled_back else 0.0
         return loss, loss_dict
 
     def _call_model(self, *args, **kwargs):
@@ -286,7 +377,7 @@ class MGNTrainer:
             return out  # (node_pred, edge_pred)
         return out, None  # node_pred, None
 
-    def forward(self, graph, physics_data):
+    def forward(self, graph, physics_data, _cons_weight_override=None):
         if self.noise_type == "pushforward":
             with autocast(device_type=self.dist.device.type, enabled=self.amp):
                 X = graph.x
@@ -349,7 +440,7 @@ class MGNTrainer:
                     loss = loss + self.physics_loss_weight * phy_loss
                     loss_dict["physics_loss"] = phy_loss
                 if self.use_local_physics_loss and physics_data is not None:
-                    eff_weight = self.get_effective_local_weight()
+                    eff_weight = _cons_weight_override if _cons_weight_override is not None else self.get_effective_local_weight()
                     local_loss_one = compute_local_conservation_loss(
                         pred_one, edge_pred_one, graph, physics_data,
                         delta_t=self.delta_t,
@@ -368,9 +459,10 @@ class MGNTrainer:
                     loss = loss + eff_weight * local_loss
                     loss_dict["local_physics_loss"] = local_loss
                     loss_dict["effective_local_weight"] = eff_weight
-                    edge_reg = compute_edge_regularization_loss(edge_pred_one, graph, use_smoothness=self.use_edge_smoothness)
-                    loss = loss + eff_weight * 0.1 * edge_reg
-                    loss_dict["edge_reg_loss"] = edge_reg
+                    if self.use_antisymmetry:
+                        edge_reg = compute_edge_regularization_loss(edge_pred_one, graph, use_smoothness=self.use_edge_smoothness)
+                        loss = loss + eff_weight * 0.1 * edge_reg
+                        loss_dict["edge_reg_loss"] = edge_reg
             return loss, loss_dict
         else:
             with autocast(device_type=self.dist.device.type, enabled=self.amp):
@@ -387,7 +479,7 @@ class MGNTrainer:
                     loss = loss + self.physics_loss_weight * phy_loss
                     loss_dict["physics_loss"] = phy_loss
                 if self.use_local_physics_loss and physics_data is not None:
-                    eff_weight = self.get_effective_local_weight()
+                    eff_weight = _cons_weight_override if _cons_weight_override is not None else self.get_effective_local_weight()
                     local_loss = compute_local_conservation_loss(
                         pred, edge_pred, graph, physics_data,
                         delta_t=self.delta_t,
@@ -398,15 +490,24 @@ class MGNTrainer:
                     loss = loss + eff_weight * local_loss
                     loss_dict["local_physics_loss"] = local_loss
                     loss_dict["effective_local_weight"] = eff_weight
-                    edge_reg = compute_edge_regularization_loss(edge_pred, graph, use_smoothness=self.use_edge_smoothness)
-                    loss = loss + eff_weight * 0.1 * edge_reg
-                    loss_dict["edge_reg_loss"] = edge_reg
+                    if self.use_antisymmetry:
+                        edge_reg = compute_edge_regularization_loss(edge_pred, graph, use_smoothness=self.use_edge_smoothness)
+                        loss = loss + eff_weight * 0.1 * edge_reg
+                        loss_dict["edge_reg_loss"] = edge_reg
             return loss, loss_dict
 
     @torch.no_grad()
     def validate(self):
         self.model.eval()
-        total_loss = 0.0
+        total_sum = 0.0
+        loss_one_sum = 0.0
+        loss_stab_sum = 0.0
+        cons_sum = 0.0
+        edge_reg_sum = 0.0
+        eff_weight_last = 0.0
+        has_cons = False
+        has_edge_reg = False
+        has_split_mse = False
         num_batches = 0
         for batch in self.val_dataloader:
             if self.use_physics_loss or self.use_local_physics_loss:
@@ -417,11 +518,52 @@ class MGNTrainer:
             graph = graph.to(self.dist.device)
             if physics_data is not None:
                 physics_data = {k: v.to(self.dist.device) for k, v in physics_data.items()}
-            loss, _ = self.forward(graph, physics_data)
-            total_loss += loss.item()
+            loss, loss_dict = self.forward(graph, physics_data)
+            total_sum += loss.item()
+            if "loss_one" in loss_dict:
+                loss_one_sum += loss_dict["loss_one"].item()
+                loss_stab_sum += loss_dict["loss_stability"].item()
+                has_split_mse = True
+            else:
+                # No-pushforward path: only mse_loss is present, attribute it to loss_one.
+                loss_one_sum += loss_dict.get("mse_loss", loss_dict["total_loss"]).item()
+            if "local_physics_loss" in loss_dict:
+                cons_sum += loss_dict["local_physics_loss"].item()
+                eff_weight_last = float(loss_dict.get("effective_local_weight", 0.0))
+                has_cons = True
+            if "edge_reg_loss" in loss_dict:
+                edge_reg_sum += loss_dict["edge_reg_loss"].item()
+                has_edge_reg = True
             num_batches += 1
         self.model.train()
-        return total_loss / num_batches if num_batches > 0 else float("inf")
+        if num_batches == 0:
+            return {
+                "total": float("inf"), "mse": float("inf"), "cons": float("inf"),
+                "loss_one": float("inf"), "loss_stability": float("inf"),
+                "local_phys_raw": float("inf"), "local_phys_weighted": float("inf"),
+                "edge_reg_raw": float("inf"), "edge_reg_weighted": float("inf"),
+                "eff_weight": 0.0, "has_cons": False, "has_edge_reg": False,
+                "has_split_mse": False,
+            }
+        loss_one_avg = loss_one_sum / num_batches
+        loss_stab_avg = loss_stab_sum / num_batches
+        cons_avg = cons_sum / num_batches if has_cons else float("inf")
+        edge_reg_avg = edge_reg_sum / num_batches if has_edge_reg else float("inf")
+        return {
+            "total": total_sum / num_batches,
+            "loss_one": loss_one_avg,
+            "loss_stability": loss_stab_avg,
+            "mse": loss_one_avg + loss_stab_avg if has_split_mse else loss_one_avg,
+            "cons": cons_avg,
+            "local_phys_raw": cons_avg,
+            "local_phys_weighted": eff_weight_last * cons_avg if has_cons else 0.0,
+            "edge_reg_raw": edge_reg_avg,
+            "edge_reg_weighted": eff_weight_last * 0.1 * edge_reg_avg if has_edge_reg else 0.0,
+            "eff_weight": eff_weight_last,
+            "has_cons": has_cons,
+            "has_edge_reg": has_edge_reg,
+            "has_split_mse": has_split_mse,
+        }
 
     def backward(self, loss):
         if self.amp:
@@ -454,6 +596,23 @@ def main(cfg: DictConfig) -> None:
     train_losses = []
     val_losses = []
 
+    # Best checkpoint tracking. Default single-criterion (val total loss); when
+    # use_triple_improvement_ckpt=true, require val total, val MSE, and val cons
+    # residual to all improve vs. their respective best-so-far before saving.
+    use_triple_ckpt = getattr(cfg, "use_triple_improvement_ckpt", False)
+    best_val_loss = float("inf")
+    best_val_mse = float("inf")
+    best_val_cons = float("inf")
+    best_ckpt_path = os.path.join(to_absolute_path(cfg.ckpt_path), "best_checkpoint.pt")
+    if trainer.epoch_init > 0 and os.path.exists(best_ckpt_path):
+        best_ckpt_data = torch.load(best_ckpt_path, map_location="cpu")
+        best_val_loss = best_ckpt_data.get("val_loss", float("inf"))
+        best_val_mse = best_ckpt_data.get("val_mse", float("inf"))
+        best_val_cons = best_ckpt_data.get("val_cons", float("inf"))
+        rank_zero_logger.info(
+            f"Resumed best_val_loss={best_val_loss:.4e} from epoch {best_ckpt_data.get('epoch', '?')}"
+        )
+
     for epoch in range(trainer.epoch_init, cfg.epochs):
         trainer.current_epoch = epoch
         epoch_loss = 0.0
@@ -467,15 +626,25 @@ def main(cfg: DictConfig) -> None:
                     epoch_components[k] = float(v)  # not accumulated, just last value
                     continue
                 val = v.detach().item() if hasattr(v, 'item') else float(v)
+                if k == "lookahead_rollback":
+                    # Accumulate rollback count (sum, not average).
+                    epoch_components[k] = epoch_components.get(k, 0.0) + val
+                    continue
                 epoch_components[k] = epoch_components.get(k, 0.0) + val
             num_batches += 1
 
         avg_loss = epoch_loss / num_batches if num_batches > 0 else float("inf")
-        val_loss = trainer.validate()
+        val_metrics = trainer.validate()
+        val_loss = val_metrics["total"]
+        val_mse = val_metrics["mse"]
+        val_cons = val_metrics["cons"]
+        val_has_cons = val_metrics["has_cons"]
         train_losses.append(avg_loss)
         val_losses.append(val_loss)
         components_str = " | ".join(
-            f"{k}: {v:.4e}" if k == "effective_local_weight" else f"{k}: {v / num_batches:.4e}"
+            f"{k}: {v:.4e}" if k == "effective_local_weight"
+            else f"{k}: {int(v)}/{num_batches} batches" if k == "lookahead_rollback"
+            else f"{k}: {v / num_batches:.4e}"
             for k, v in epoch_components.items()
             if k != "total_loss"
         )
@@ -484,6 +653,42 @@ def main(cfg: DictConfig) -> None:
         )
         if components_str:
             rank_zero_logger.info(f"  Components: {components_str}")
+
+        # Lowpass diagnostic: log alpha and pre/post feature dispersion ratio.
+        # Cheap (one extra encoder + filter pass on the first val sample).
+        _model = trainer.model.module if hasattr(trainer.model, "module") else trainer.model
+        if getattr(_model, "lowpass", None) is not None and dist.rank == 0:
+            try:
+                with torch.no_grad():
+                    _val_iter = iter(trainer.val_dataloader)
+                    _sample = next(_val_iter)
+                    _g = _sample[0] if isinstance(_sample, (tuple, list)) else _sample
+                    _g = _g.to(trainer.dist.device)
+                    # Reconstruct the one-step window the model is trained on
+                    # (mirrors trainer.forward at lines 383-394).
+                    _X = _g.x
+                    _n_static = 12
+                    _n_time = (_X.shape[1] - _n_static) // 2
+                    _static = _X[:, :_n_static]
+                    _wd = _X[:, _n_static : _n_static + _n_time][:, 1:]
+                    _vol = _X[:, _n_static + _n_time : _n_static + 2 * _n_time][:, 1:]
+                    _X_one = torch.cat([_static, _wd, _vol], dim=1)
+                    _h_pre = _model.node_encoder(_X_one)
+                    _h_post = _model.lowpass(_h_pre, _g.edge_index)
+                    _pre_std = _h_pre.std(dim=0).mean().item()
+                    _post_std = _h_post.std(dim=0).mean().item()
+                    _ratio = _post_std / max(_pre_std, 1e-12)
+                    _alpha_t = _model.lowpass.alpha
+                    _alpha = (
+                        _alpha_t.mean().item() if _alpha_t.dim() > 0 else _alpha_t.item()
+                    )
+                rank_zero_logger.info(
+                    f"  Lowpass: alpha={_alpha:.4f} | "
+                    f"pre_std={_pre_std:.4e} | post_std={_post_std:.4e} | "
+                    f"dispersion_ratio={_ratio:.4f}"
+                )
+            except StopIteration:
+                pass
 
         wandb.log(
             {
@@ -517,6 +722,50 @@ def main(cfg: DictConfig) -> None:
                 epoch=epoch,
             )
             rank_zero_logger.info(f"Checkpoint saved at epoch {epoch}.")
+
+            # Save best checkpoint. Single-criterion by default; triple-criterion
+            # (total, MSE, and unweighted conservation residual all improve vs.
+            # best-so-far) when use_triple_improvement_ckpt=true.
+            if use_triple_ckpt:
+                cons_improved = (not val_has_cons) or (val_cons < best_val_cons)
+                should_save = (
+                    val_loss < best_val_loss
+                    and val_mse < best_val_mse
+                    and cons_improved
+                )
+            else:
+                should_save = val_loss < best_val_loss
+
+            if should_save:
+                best_val_loss = val_loss
+                best_val_mse = val_mse
+                if val_has_cons:
+                    best_val_cons = val_cons
+                model_to_save = trainer.model
+                if hasattr(model_to_save, "module"):
+                    model_to_save = model_to_save.module
+                torch.save(
+                    {
+                        "epoch": epoch,
+                        "model_state_dict": model_to_save.state_dict(),
+                        "val_loss": val_loss,
+                        "val_mse": val_mse,
+                        "val_cons": val_cons if val_has_cons else float("inf"),
+                    },
+                    best_ckpt_path,
+                )
+                rank_zero_logger.info(
+                    f"Best checkpoint updated at epoch {epoch} "
+                    f"(val_loss={val_loss:.4e}, val_mse={val_mse:.4e}, "
+                    f"val_cons={val_cons:.4e})"
+                )
+            elif use_triple_ckpt:
+                rank_zero_logger.info(
+                    f"Best checkpoint NOT updated at epoch {epoch} "
+                    f"(triple-improvement rule: total={val_loss:.4e} vs {best_val_loss:.4e}, "
+                    f"mse={val_mse:.4e} vs {best_val_mse:.4e}, "
+                    f"cons={val_cons:.4e} vs {best_val_cons:.4e})"
+                )
 
         elapsed = time.time() - start_time
         rank_zero_logger.info(f"Epoch {epoch} duration: {elapsed:.2f} seconds.")

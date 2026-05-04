@@ -64,11 +64,46 @@ physics_loss_weight: 1.0
 use_local_physics_loss: true
 local_physics_loss_weight: 0.1
 use_edge_smoothness: true
+use_antisymmetry: true          # Enforce Q(i->j) = -Q(j->i) on edge flows; set false to ablate
 local_loss_warmup_epochs: 0    # 0 = no warmup; >0 = linear ramp from 0 to target weight over N epochs
 use_boundary_masking: false    # Exclude convex hull nodes from local conservation loss
 use_huber_residual: false      # Use smooth_l1 instead of L1 for conservation residual
 huber_beta: 0.5               # Beta (transition point) for smooth_l1_loss; only used if use_huber_residual=true
 graph_type: knn                # "knn" (default) or "delaunay"
+
+# Lookahead conservation gating (professor's suggestion).
+# Each batch: tentative full step → check if MSE worsened → roll back and step MSE-only if so.
+# Default false keeps all existing runs unaffected.
+use_lookahead_gating: false
+lookahead_tolerance: 0.0      # Fractional MSE increase allowed before triggering rollback (0.0 = any degradation)
+
+# Conservation weight decay schedule.
+# After cons_weight_decay_start_epoch, linearly decays the conservation weight from its
+# configured value toward cons_weight_decay_floor over cons_weight_decay_length epochs.
+# Default false keeps all existing runs unaffected.
+use_cons_weight_decay: false
+cons_weight_decay_start_epoch: 20   # Epoch at which decay begins (absolute epoch number)
+cons_weight_decay_length: 30        # Epochs over which weight decays from full to floor
+cons_weight_decay_floor: 0.0        # Minimum weight after decay (0.0 = fully off)
+
+# v10: Graph low-pass smoothing filter on encoded node features.
+# Applies h' = (1-alpha) * h + alpha * (A_norm)^K @ h between encoder and processor.
+# Targets the rollout-distribution-shift identified in validation_loss_breakdown_v1.md.
+# Default disabled keeps v7/v8/v9 reproducibility intact.
+lowpass:
+  enabled: false
+  iterations: 1                 # K: how many times A_norm is applied per forward
+  alpha_init: 0.2               # blend coefficient (0=identity, 1=full smoothing)
+  learnable_alpha: false        # if true, alpha becomes a sigmoid-parameterized nn.Parameter
+  alpha_per_channel: false      # if true, alpha has shape [hidden_dim_processor]
+
+# Triple-improvement checkpoint criterion (professor's simple-lookahead suggestion).
+# When true, best_checkpoint.pt is saved only if val total loss, val nodal MSE, and val
+# local conservation residual all improve vs. their respective best-so-far. Protects
+# against pathological regimes where total val loss decreases while conservation
+# actually regresses (e.g. v9 Run 2). Zero training-time overhead.
+# Default false preserves original single-criterion behaviour.
+use_triple_improvement_ckpt: false
 
 # Node loss type.
 node_loss_type: "mse"          # "mse" or "huber"
