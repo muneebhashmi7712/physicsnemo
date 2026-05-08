@@ -84,6 +84,16 @@ class MGNTrainer:
         self.local_physics_loss_weight = cfg.get("local_physics_loss_weight", 0.1)
         self.edge_loss_weight = cfg.get("edge_loss_weight", 1.0)
 
+        # 1D coupling toggle.
+        self.use_1d = cfg.get("use_1d", False)
+        self.n_time_steps = cfg.n_time_steps
+        # The dynamic block in graph.x has 2 * window_size columns (one half
+        # water_depth, the other volume). With pushforward noise the dataset
+        # supplies one extra timestep so window_size = n_time_steps + 1.
+        self.dynamic_window = self.n_time_steps + (
+            1 if cfg.noise_type == "pushforward" else 0
+        )
+
         # Set activation function.
         mlp_act = "relu"
         if cfg.recompute_activation:
@@ -104,6 +114,7 @@ class MGNTrainer:
             num_samples=cfg.num_training_samples,
             return_physics=self.use_physics_loss or self.use_local_physics_loss,
             delta_t=self.delta_t,
+            use_1d=self.use_1d,
         )
         sampler = DistributedSampler(
             dataset,
@@ -240,8 +251,12 @@ class MGNTrainer:
         if self.noise_type == "pushforward":
             with autocast(device_type=self.dist.device.type, enabled=self.amp):
                 X = graph.x
-                n_static = 12  # assumed static features dimension
-                n_time = (X.shape[1] - n_static) // 2
+                # Dynamic block (water_depth window + volume window) is at the
+                # END of every row in both 2D-only and use_1d schemas. Width of
+                # each half = n_time_steps (+1 under pushforward). Derive
+                # n_static from total - 2 * window so it works for both schemas.
+                n_time = self.dynamic_window
+                n_static = X.shape[1] - 2 * n_time
                 static_part = X[:, :n_static]
                 water_depth_full = X[:, n_static : n_static + n_time]
                 volume_full = X[:, n_static + n_time : n_static + 2 * n_time]

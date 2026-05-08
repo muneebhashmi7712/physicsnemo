@@ -74,6 +74,7 @@ class UrbanFloodDataset(Dataset):
         rollout_length: Optional[int] = None,
         return_physics: bool = False,
         delta_t: float = 300.0,
+        use_1d: bool = False,
     ):
         if split not in {"train", "test"}:
             raise ValueError(f"Invalid split '{split}'. Expected 'train' or 'test'.")
@@ -89,6 +90,7 @@ class UrbanFloodDataset(Dataset):
         self.rollout_length = rollout_length if rollout_length is not None else 0
         self.return_physics = return_physics
         self.delta_t = delta_t
+        self.use_1d = use_1d
 
         self.static_data = {}
         self.dynamic_data = []
@@ -96,7 +98,11 @@ class UrbanFloodDataset(Dataset):
         self.event_ids = []
         self.static_stats = {}
         self.dynamic_stats = {}
-        self.num_fwd_edges = 0  # set during process()
+        self.num_fwd_edges = 0          # 2D forward edge count
+        self.num_1d_fwd_edges = 0       # 1D pipe forward edge count
+        self.num_conn_edges = 0         # 1D-2D connection forward edge count
+        self.num_2d_nodes = 0
+        self.num_1d_nodes = 0
 
         self.process()
 
@@ -117,7 +123,10 @@ class UrbanFloodDataset(Dataset):
                 infiltration,
                 self.static_stats,
             ) = self.load_static_data(self.split_dir, norm_stats_static=None)
-            self.save_norm_stats(self.static_stats, STATIC_NORM_STATS_FILE)
+            # Note: when use_1d, static stats are saved again after 1D loading
+            # below so depth_1d / base_area_1d are persisted with the 2D keys.
+            if not self.use_1d:
+                self.save_norm_stats(self.static_stats, STATIC_NORM_STATS_FILE)
         else:
             self.static_stats = self.load_norm_stats(STATIC_NORM_STATS_FILE)
             (
@@ -137,6 +146,7 @@ class UrbanFloodDataset(Dataset):
             )
 
         num_nodes = xy_coords.shape[0]
+        self.num_2d_nodes = num_nodes
 
         # --- Load edge connectivity and features ---
         edge_index, edge_features = self.load_edge_data(self.split_dir)
@@ -155,6 +165,98 @@ class UrbanFloodDataset(Dataset):
             "edge_index": edge_index,
             "edge_features": edge_features,
         }
+
+        # --- 1D system: nodes, pipes, 1D<->2D connections ---
+        if self.use_1d:
+            (
+                xy_1d,
+                depth_1d,
+                invert_elev_1d,
+                surface_elev_1d,
+                base_area_1d,
+                base_area_1d_denorm,
+                self.static_stats,
+            ) = self.load_1d_static_data(self.split_dir, self.static_stats)
+
+            self.num_1d_nodes = xy_1d.shape[0]
+
+            # 1D pipe edges (reindex node ids by +num_2d_nodes).
+            edge_index_1d, edge_feat_1d = self.load_1d_edge_data(self.split_dir)
+            edge_index_1d = edge_index_1d + self.num_2d_nodes  # all 1D node ids
+
+            # 1D <-> 2D connection edges (node_2d unchanged, node_1d shifted).
+            edge_index_conn, conn_node_1d_local = self.load_1d2d_connections(
+                self.split_dir
+            )
+
+            # Bidirectionalise pipe and connection edges (mirrors 2D handling).
+            edge_index_1d_bi, edge_feat_1d_bi = self._bidirect(
+                edge_index_1d, edge_feat_1d, negate_first_two=True
+            )
+            edge_feat_conn = self._connection_edge_features(
+                edge_index_conn, xy_coords, xy_1d
+            )
+            edge_index_conn_bi, edge_feat_conn_bi = self._bidirect(
+                edge_index_conn, edge_feat_conn, negate_first_two=True
+            )
+
+            # Build edge_type one-hot (3 cols: 2D mesh, 1D pipe, connection).
+            E_2d_bi = edge_index.shape[1]
+            E_1d_bi = edge_index_1d_bi.shape[1]
+            E_conn_bi = edge_index_conn_bi.shape[1]
+            n_2d_feat = edge_features.shape[1]              # 3 (rel_x, rel_y, length)
+            n_1d_feat = edge_feat_1d_bi.shape[1]            # 7 (+ diam, shape, rough, slope)
+            n_conn_feat = edge_feat_conn_bi.shape[1]        # 3
+
+            common = 3                                        # rel_x, rel_y, length
+            pipe_extra = n_1d_feat - common                   # 4 cols only on 1D pipes
+
+            # Pad 2D and connection edges to match 1D feature width.
+            edge_features_padded = np.hstack(
+                [edge_features, np.zeros((E_2d_bi, pipe_extra), dtype=edge_features.dtype)]
+            )
+            edge_feat_conn_padded = np.hstack(
+                [edge_feat_conn_bi, np.zeros((E_conn_bi, pipe_extra), dtype=edge_features.dtype)]
+            )
+
+            # One-hot type appended to all edges.
+            type_2d = np.tile(np.array([1.0, 0.0, 0.0]), (E_2d_bi, 1))
+            type_1d = np.tile(np.array([0.0, 1.0, 0.0]), (E_1d_bi, 1))
+            type_cn = np.tile(np.array([0.0, 0.0, 1.0]), (E_conn_bi, 1))
+
+            edge_features_2d = np.hstack([edge_features_padded, type_2d])
+            edge_features_1d = np.hstack([edge_feat_1d_bi, type_1d])
+            edge_features_cn = np.hstack([edge_feat_conn_padded, type_cn])
+
+            edge_index_all = np.concatenate(
+                [edge_index, edge_index_1d_bi, edge_index_conn_bi], axis=1
+            )
+            edge_features_all = np.vstack(
+                [edge_features_2d, edge_features_1d, edge_features_cn]
+            )
+
+            self.static_data.update(
+                {
+                    "xy_1d": xy_1d,
+                    "depth_1d": depth_1d,
+                    "invert_elev_1d": invert_elev_1d,
+                    "surface_elev_1d": surface_elev_1d,
+                    "base_area_1d": base_area_1d,
+                    "base_area_1d_denorm": base_area_1d_denorm,
+                    "edge_index": edge_index_all,
+                    "edge_features": edge_features_all,
+                    "edge_index_2d": edge_index,            # for source-term scatter slicing
+                    "edge_index_1d": edge_index_1d_bi,
+                    "edge_index_conn": edge_index_conn_bi,
+                    "conn_node_1d_local": conn_node_1d_local,  # (E_conn_fwd,)
+                }
+            )
+
+            self.num_conn_edges = edge_index_conn.shape[1]      # forward count
+
+            # Persist combined 2D + 1D static stats for the test split to load.
+            if self.split == "train":
+                self.save_norm_stats(self.static_stats, STATIC_NORM_STATS_FILE)
 
         # --- Discover events ---
         all_entries = os.listdir(self.split_dir)
@@ -181,34 +283,99 @@ class UrbanFloodDataset(Dataset):
             edge_flow = self.load_edge_dynamic_data(
                 event_dir, self.num_fwd_edges
             )
-            temp_dynamic_data.append(
-                {
-                    "water_depth": water_level,
-                    "inflow_hydrograph": inflow,
-                    "volume": volume,
-                    "precipitation": rainfall,
-                    "edge_flow": edge_flow,
-                    "event_id": event_id,
-                }
-            )
-            water_depth_list.append(water_level.flatten())
-            volume_list.append(volume.flatten())
+
+            sample = {
+                "water_depth": water_level,
+                "inflow_hydrograph": inflow,
+                "volume": volume,
+                "precipitation": rainfall,
+                "edge_flow": edge_flow,
+                "event_id": event_id,
+            }
+
+            if self.use_1d:
+                wl_1d, inlet_flow_1d, vol_1d = self.load_1d_dynamic_data(
+                    event_dir,
+                    self.num_1d_nodes,
+                    self.static_data["base_area_1d_denorm"],
+                )
+                edge_flow_1d = self.load_1d_edge_dynamic_data(
+                    event_dir, self.num_1d_fwd_edges
+                )
+                # Concatenate 2D + 1D water_level and volume along the node axis.
+                sample["water_depth"] = np.concatenate([water_level, wl_1d], axis=1)
+                sample["volume"] = np.concatenate([volume, vol_1d], axis=1)
+                sample["edge_flow_1d"] = edge_flow_1d
+                sample["inlet_flow_1d"] = inlet_flow_1d  # used as connection-edge GT
+
+            temp_dynamic_data.append(sample)
+            water_depth_list.append(sample["water_depth"].flatten())
+            volume_list.append(sample["volume"].flatten())
             precipitation_list.append(rainfall.flatten())
             inflow_list.append(inflow.flatten())
 
         # --- Compute or load dynamic normalization stats ---
+        # v2: when use_1d, water_depth and volume stats are split per node-type
+        # (2D vs 1D) under "2d" / "1d" sub-keys. Legacy "mean" / "std" keys are
+        # kept for backward-compat and point at the 2D stats. Edge-flow stats
+        # are also split per edge-type (2d pipe / 1d pipe / connection).
+        N_2d = self.num_2d_nodes
+        N_1d = self.num_1d_nodes
         if self.split == "train":
             self.dynamic_stats = {}
-            water_depth_all = np.concatenate(water_depth_list)
-            self.dynamic_stats["water_depth"] = {
-                "mean": float(np.mean(water_depth_all)),
-                "std": float(np.std(water_depth_all)),
-            }
-            volume_all = np.concatenate(volume_list)
-            self.dynamic_stats["volume"] = {
-                "mean": float(np.mean(volume_all)),
-                "std": float(np.std(volume_all)),
-            }
+            # Note: each item in water_depth_list / volume_list is shape (T, N).
+            # We split along the node axis BEFORE flattening so stats are
+            # computed only over their own node type.
+            if self.use_1d:
+                wd_2d_all = np.concatenate(
+                    [a.reshape(-1, N_2d + N_1d)[:, :N_2d].flatten()
+                     for a in water_depth_list]
+                )
+                wd_1d_all = np.concatenate(
+                    [a.reshape(-1, N_2d + N_1d)[:, N_2d:].flatten()
+                     for a in water_depth_list]
+                )
+                vol_2d_all = np.concatenate(
+                    [a.reshape(-1, N_2d + N_1d)[:, :N_2d].flatten()
+                     for a in volume_list]
+                )
+                vol_1d_all = np.concatenate(
+                    [a.reshape(-1, N_2d + N_1d)[:, N_2d:].flatten()
+                     for a in volume_list]
+                )
+                wd_2d_stats = {"mean": float(np.mean(wd_2d_all)),
+                               "std":  float(np.std(wd_2d_all))}
+                wd_1d_stats = {"mean": float(np.mean(wd_1d_all)),
+                               "std":  float(np.std(wd_1d_all))}
+                vol_2d_stats = {"mean": float(np.mean(vol_2d_all)),
+                                "std":  float(np.std(vol_2d_all))}
+                vol_1d_stats = {"mean": float(np.mean(vol_1d_all)),
+                                "std":  float(np.std(vol_1d_all))}
+                self.dynamic_stats["water_depth"] = {
+                    "2d": wd_2d_stats, "1d": wd_1d_stats,
+                    "mean": wd_2d_stats["mean"], "std": wd_2d_stats["std"],
+                }
+                self.dynamic_stats["volume"] = {
+                    "2d": vol_2d_stats, "1d": vol_1d_stats,
+                    "mean": vol_2d_stats["mean"], "std": vol_2d_stats["std"],
+                }
+                logger.info(
+                    f"v2 per-type stats — 2D vol mean/std = "
+                    f"{vol_2d_stats['mean']:.2f}/{vol_2d_stats['std']:.2f}; "
+                    f"1D vol mean/std = "
+                    f"{vol_1d_stats['mean']:.2f}/{vol_1d_stats['std']:.2f}"
+                )
+            else:
+                water_depth_all = np.concatenate(water_depth_list)
+                self.dynamic_stats["water_depth"] = {
+                    "mean": float(np.mean(water_depth_all)),
+                    "std":  float(np.std(water_depth_all)),
+                }
+                volume_all = np.concatenate(volume_list)
+                self.dynamic_stats["volume"] = {
+                    "mean": float(np.mean(volume_all)),
+                    "std":  float(np.std(volume_all)),
+                }
             precipitation_all = np.concatenate(precipitation_list)
             self.dynamic_stats["precipitation"] = {
                 "mean": float(np.mean(precipitation_all)),
@@ -219,6 +386,41 @@ class UrbanFloodDataset(Dataset):
                 "mean": float(np.mean(inflow_all)),
                 "std": float(np.std(inflow_all)),
             }
+
+            # v2: per-edge-type flow std (no mean — flows are signed). These
+            # are scales for raw m³/s flows, so the conversion to "vol per
+            # step" units is `flow_phys * delta_t / sigma_phys` where
+            # sigma_phys is the correct edge-type std.
+            if self.use_1d:
+                ef_2d_all = np.concatenate(
+                    [d["edge_flow"].flatten() for d in temp_dynamic_data]
+                )
+                ef_1d_all = np.concatenate(
+                    [d["edge_flow_1d"].flatten() for d in temp_dynamic_data]
+                )
+                # Connection-edge GT flow comes from inlet_flow_1d at the 1D
+                # end of each connection. Pool over (time × connections).
+                conn_local = self.static_data["conn_node_1d_local"]
+                conn_flow_all = np.concatenate(
+                    [d["inlet_flow_1d"][:, conn_local].flatten()
+                     for d in temp_dynamic_data]
+                )
+                self.dynamic_stats["edge_flow_2d"] = {
+                    "std": float(np.std(ef_2d_all))
+                }
+                self.dynamic_stats["edge_flow_1d"] = {
+                    "std": float(np.std(ef_1d_all))
+                }
+                self.dynamic_stats["edge_flow_conn"] = {
+                    "std": float(np.std(conn_flow_all))
+                }
+                logger.info(
+                    f"v2 per-edge-type flow std (raw m³/s) — "
+                    f"2D = {self.dynamic_stats['edge_flow_2d']['std']:.4f}; "
+                    f"1D = {self.dynamic_stats['edge_flow_1d']['std']:.4f}; "
+                    f"conn = {self.dynamic_stats['edge_flow_conn']['std']:.4f}"
+                )
+
             self.save_norm_stats(self.dynamic_stats, DYNAMIC_NORM_STATS_FILE)
         else:
             self.dynamic_stats = self.load_norm_stats(DYNAMIC_NORM_STATS_FILE)
@@ -226,17 +428,37 @@ class UrbanFloodDataset(Dataset):
         # --- Normalize dynamic data ---
         self.dynamic_data = []
         for dyn in temp_dynamic_data:
-            dyn_std = {
-                "water_depth": self.normalize(
-                    dyn["water_depth"],
-                    self.dynamic_stats["water_depth"]["mean"],
-                    self.dynamic_stats["water_depth"]["std"],
-                ),
-                "volume": self.normalize(
+            if self.use_1d:
+                vol_2d_stats = self.dynamic_stats["volume"]["2d"]
+                vol_1d_stats = self.dynamic_stats["volume"]["1d"]
+                wd_2d_stats  = self.dynamic_stats["water_depth"]["2d"]
+                wd_1d_stats  = self.dynamic_stats["water_depth"]["1d"]
+                vol_norm = np.concatenate([
+                    self.normalize(dyn["volume"][:, :N_2d],
+                                   vol_2d_stats["mean"], vol_2d_stats["std"]),
+                    self.normalize(dyn["volume"][:, N_2d:],
+                                   vol_1d_stats["mean"], vol_1d_stats["std"]),
+                ], axis=1)
+                wd_norm = np.concatenate([
+                    self.normalize(dyn["water_depth"][:, :N_2d],
+                                   wd_2d_stats["mean"], wd_2d_stats["std"]),
+                    self.normalize(dyn["water_depth"][:, N_2d:],
+                                   wd_1d_stats["mean"], wd_1d_stats["std"]),
+                ], axis=1)
+            else:
+                vol_norm = self.normalize(
                     dyn["volume"],
                     self.dynamic_stats["volume"]["mean"],
                     self.dynamic_stats["volume"]["std"],
-                ),
+                )
+                wd_norm = self.normalize(
+                    dyn["water_depth"],
+                    self.dynamic_stats["water_depth"]["mean"],
+                    self.dynamic_stats["water_depth"]["std"],
+                )
+            dyn_std = {
+                "water_depth": wd_norm,
+                "volume": vol_norm,
                 "precipitation": self.normalize(
                     dyn["precipitation"],
                     self.dynamic_stats["precipitation"]["mean"],
@@ -250,6 +472,10 @@ class UrbanFloodDataset(Dataset):
                 "edge_flow": dyn["edge_flow"],  # raw m³/s, converted at __getitem__ time
                 "event_id": dyn["event_id"],
             }
+            if self.use_1d:
+                # raw m³/s for 1D pipe edges and inlet flows; converted at __getitem__ time
+                dyn_std["edge_flow_1d"] = dyn["edge_flow_1d"]
+                dyn_std["inlet_flow_1d"] = dyn["inlet_flow_1d"]
             self.dynamic_data.append(dyn_std)
 
         # --- Build sample indices ---
@@ -275,6 +501,43 @@ class UrbanFloodDataset(Dataset):
             self.length = len(self.dynamic_data)
             logger.info(f"Test samples: {self.length}")
 
+    def _unified_static_blocks(self):
+        """Build node static arrays of length N = N_2d + N_1d for the unified
+        graph. 2D-only static columns get zeros for 1D rows; the shared
+        elevation column gets surface_elev_1d for 1D rows; the trailing
+        ``extra_static`` block carries 1D-only quantities + a node_type bit
+        (0 = 2D, 1 = 1D)."""
+        sd = self.static_data
+        n_2d = self.num_2d_nodes
+        n_1d = self.num_1d_nodes
+        zeros = lambda c: np.zeros((n_1d, c), dtype=sd["xy_coords"].dtype)
+        zeros_2d = lambda c: np.zeros((n_2d, c), dtype=sd["xy_coords"].dtype)
+
+        xy = np.vstack([sd["xy_coords"], sd["xy_1d"]])
+        area = np.vstack([sd["area"], zeros(1)])
+        # Shared elevation column: 2D ground elev, 1D surface elev (same scale).
+        elevation = np.vstack([sd["elevation"], sd["surface_elev_1d"]])
+        slope = np.vstack([sd["slope"], zeros(1)])
+        aspect = np.vstack([sd["aspect"], zeros(1)])
+        curvature = np.vstack([sd["curvature"], zeros(1)])
+        manning = np.vstack([sd["manning"], zeros(1)])
+        flow_accum = np.vstack([sd["flow_accum"], zeros(1)])
+        infiltration = np.vstack([sd["infiltration"], zeros(1)])
+
+        # Extra static block: depth_1d, invert_elev_1d, base_area_1d, node_type
+        depth_1d_full = np.vstack([zeros_2d(1), sd["depth_1d"]])
+        invert_1d_full = np.vstack([zeros_2d(1), sd["invert_elev_1d"]])
+        base_area_full = np.vstack([zeros_2d(1), sd["base_area_1d"]])
+        node_type = np.vstack(
+            [np.zeros((n_2d, 1)), np.ones((n_1d, 1))]
+        ).astype(sd["xy_coords"].dtype)
+        extra = np.hstack([depth_1d_full, invert_1d_full, base_area_full, node_type])
+
+        return (
+            xy, area, elevation, slope, aspect, curvature,
+            manning, flow_accum, infiltration, extra,
+        )
+
     def __getitem__(self, idx: int):
         """Retrieve a graph sample."""
         sd = self.static_data
@@ -289,22 +552,31 @@ class UrbanFloodDataset(Dataset):
                 else t_idx + self.n_time_steps
             )
 
+            if self.use_1d:
+                (
+                    xy, area, elev, slope, aspect, curv,
+                    manning, flow_accum, infilt, extra,
+                ) = self._unified_static_blocks()
+            else:
+                xy, area, elev, slope, aspect, curv = (
+                    sd["xy_coords"], sd["area"], sd["elevation"],
+                    sd["slope"], sd["aspect"], sd["curvature"],
+                )
+                manning, flow_accum, infilt = (
+                    sd["manning"], sd["flow_accum"], sd["infiltration"],
+                )
+                extra = None
+
             node_features, future_flow, future_precip = self.create_node_features(
-                sd["xy_coords"],
-                sd["area"],
-                sd["elevation"],
-                sd["slope"],
-                sd["aspect"],
-                sd["curvature"],
-                sd["manning"],
-                sd["flow_accum"],
-                sd["infiltration"],
+                xy, area, elev, slope, aspect, curv,
+                manning, flow_accum, infilt,
                 dyn["water_depth"][t_idx:end_index, :],
                 dyn["volume"][t_idx:end_index, :],
                 dyn["precipitation"],
                 t_idx,
                 self.n_time_steps,
                 dyn["inflow_hydrograph"],
+                extra_static=extra,
             )
             target_time = t_idx + self.n_time_steps
             prev_time = target_time - 1
@@ -325,37 +597,109 @@ class UrbanFloodDataset(Dataset):
             g.x = torch.tensor(node_features, dtype=torch.float)
             g.y = torch.tensor(target, dtype=torch.float)
 
-            # Edge flow targets: delta-Q and Q_prev in normalized volume per step.
+            if self.use_1d:
+                # 0 for 2D rows, 1 for 1D rows. Used for per-type RMSE / loss masking.
+                g.node_type = torch.tensor(
+                    np.concatenate(
+                        [
+                            np.zeros(self.num_2d_nodes, dtype=np.int64),
+                            np.ones(self.num_1d_nodes, dtype=np.int64),
+                        ]
+                    ),
+                    dtype=torch.long,
+                )
+
+            # Edge flow targets: delta-Q and Q_prev. v2 normalises per-edge by
+            # the edge-type's flow std and per-node by the node-type's volume
+            # std, so the conservation residual can be formed in physical
+            # units (m³) and then made dimensionless by dividing by the
+            # per-node volume std.
             if self.return_physics and self.num_fwd_edges > 0:
-                edge_flow = dyn["edge_flow"]  # (T, E_fwd) raw m³/s
-                flow_prev = edge_flow[prev_time, :]       # (E_fwd,) m³/s
-                flow_target = edge_flow[target_time, :]    # (E_fwd,) m³/s
+                num_nodes_s = (
+                    self.num_2d_nodes + self.num_1d_nodes
+                    if self.use_1d
+                    else sd["xy_coords"].shape[0]
+                )
 
-                # Make bidirectional: reverse edges carry negated flow.
-                flow_prev_bi = np.concatenate([flow_prev, -flow_prev])
-                flow_target_bi = np.concatenate([flow_target, -flow_target])
+                if self.use_1d:
+                    V_std_2d = self.dynamic_stats["volume"]["2d"]["std"]
+                    V_std_1d = self.dynamic_stats["volume"]["1d"]["std"]
+                    sigma_2d_phys  = self.dynamic_stats["edge_flow_2d"]["std"] * self.delta_t
+                    sigma_1d_phys  = self.dynamic_stats["edge_flow_1d"]["std"] * self.delta_t
+                    sigma_cn_phys  = self.dynamic_stats["edge_flow_conn"]["std"] * self.delta_t
+                    sigma_per_edge_fwd = np.concatenate([
+                        np.full(self.num_fwd_edges,    sigma_2d_phys, dtype=np.float64),
+                        np.full(self.num_1d_fwd_edges, sigma_1d_phys, dtype=np.float64),
+                        np.full(self.num_conn_edges,   sigma_cn_phys, dtype=np.float64),
+                    ])
+                    V_std_per_node = np.concatenate([
+                        np.full(self.num_2d_nodes, V_std_2d, dtype=np.float64),
+                        np.full(self.num_1d_nodes, V_std_1d, dtype=np.float64),
+                    ])
+                    # Unified raw forward-edge flow vector ordered
+                    # [2D pipes | 1D pipes | 1D<->2D connections].
+                    flow_2d_prev = dyn["edge_flow"][prev_time, :]
+                    flow_2d_targ = dyn["edge_flow"][target_time, :]
+                    flow_1d_prev = dyn["edge_flow_1d"][prev_time, :]
+                    flow_1d_targ = dyn["edge_flow_1d"][target_time, :]
+                    conn_local = sd["conn_node_1d_local"]
+                    flow_conn_prev = dyn["inlet_flow_1d"][prev_time, conn_local]
+                    flow_conn_targ = dyn["inlet_flow_1d"][target_time, conn_local]
+                    flow_prev_fwd = np.concatenate(
+                        [flow_2d_prev, flow_1d_prev, flow_conn_prev]
+                    )
+                    flow_targ_fwd = np.concatenate(
+                        [flow_2d_targ, flow_1d_targ, flow_conn_targ]
+                    )
+                else:
+                    # Backward-compat: single shared volume std applied to
+                    # every edge and every node. The math reduces to the
+                    # v1/v5 formulation bit-identically.
+                    V_std_shared = self.dynamic_stats["volume"]["std"]
+                    sigma_per_edge_fwd = np.full(
+                        self.num_fwd_edges, V_std_shared, dtype=np.float64
+                    )
+                    V_std_per_node = np.full(
+                        num_nodes_s, V_std_shared, dtype=np.float64
+                    )
+                    flow_prev_fwd = dyn["edge_flow"][prev_time, :]
+                    flow_targ_fwd = dyn["edge_flow"][target_time, :]
 
-                # Convert to normalized volume per step: Q_phys * dt / V_std
-                V_std = self.dynamic_stats["volume"]["std"]
-                delta_Q_norm = (flow_target_bi - flow_prev_bi) * self.delta_t / V_std
-                Q_prev_norm = flow_prev_bi * self.delta_t / V_std
+                # Same sigma applies to forward + reverse halves; reverse
+                # carries negated flow so the magnitude scale is identical.
+                sigma_per_edge = np.concatenate([sigma_per_edge_fwd, sigma_per_edge_fwd])
+                flow_prev_bi  = np.concatenate([flow_prev_fwd, -flow_prev_fwd])
+                flow_targ_bi  = np.concatenate([flow_targ_fwd, -flow_targ_fwd])
+
+                # Q in physical units (m³ per step) and normalised by per-edge sigma.
+                Q_prev_phys   = flow_prev_bi * self.delta_t
+                Q_target_phys = flow_targ_bi * self.delta_t
+                Q_prev_norm   = Q_prev_phys / sigma_per_edge
+                delta_Q_norm  = (Q_target_phys - Q_prev_phys) / sigma_per_edge
 
                 g.edge_y = torch.tensor(delta_Q_norm, dtype=torch.float).unsqueeze(-1)
                 g.edge_q_prev = torch.tensor(Q_prev_norm, dtype=torch.float)
+                g.Q_sigma_per_edge_phys = torch.tensor(
+                    sigma_per_edge, dtype=torch.float
+                )
+                g.V_std_per_node = torch.tensor(V_std_per_node, dtype=torch.float)
 
-                # Ground-truth per-node source term for local conservation loss.
-                # S_gt = delta_V_gt - net_flow_gt captures rainfall - infiltration
-                # + boundary effects — everything not explained by inter-cell flows.
-                delta_V_gt = dyn["volume"][target_time, :] - dyn["volume"][prev_time, :]
-                Q_target_norm = flow_target_bi * self.delta_t / V_std
-                num_nodes_s = sd["xy_coords"].shape[0]
-                Q_in_gt = np.zeros(num_nodes_s)
-                np.add.at(Q_in_gt, dst, Q_target_norm)
-                Q_out_gt = np.zeros(num_nodes_s)
-                np.add.at(Q_out_gt, src, Q_target_norm)
-                net_flow_gt = (Q_in_gt - Q_out_gt) / 2.0
+                # Ground-truth per-node source term, in V_std-per-node units.
+                # ΔV_phys[i] = ΔV_norm[i] * V_std_per_node[i]. Both 2D and 1D
+                # nodes have ΔV_norm = (V_norm[t] − V_norm[t-1])[i] because
+                # the per-type mean cancels in the difference.
+                delta_V_norm_node = (
+                    dyn["volume"][target_time, :] - dyn["volume"][prev_time, :]
+                )
+                delta_V_phys = delta_V_norm_node * V_std_per_node
+                Q_in_phys = np.zeros(num_nodes_s)
+                np.add.at(Q_in_phys, dst, Q_target_phys)
+                Q_out_phys = np.zeros(num_nodes_s)
+                np.add.at(Q_out_phys, src, Q_target_phys)
+                net_flow_phys = (Q_in_phys - Q_out_phys) / 2.0
+                S_phys = delta_V_phys - net_flow_phys              # m³
                 g.source_term = torch.tensor(
-                    delta_V_gt - net_flow_gt, dtype=torch.float
+                    S_phys / V_std_per_node, dtype=torch.float
                 )
 
             need_physics = self.return_physics or (self.noise_type == "pushforward")
@@ -465,22 +809,30 @@ class UrbanFloodDataset(Dataset):
         else:
             # --- Test mode: full event with rollout data ---
             dyn = self.dynamic_data[idx]
+            if self.use_1d:
+                (
+                    xy, area, elev, slope, aspect, curv,
+                    manning, flow_accum, infilt, extra,
+                ) = self._unified_static_blocks()
+            else:
+                xy, area, elev, slope, aspect, curv = (
+                    sd["xy_coords"], sd["area"], sd["elevation"],
+                    sd["slope"], sd["aspect"], sd["curvature"],
+                )
+                manning, flow_accum, infilt = (
+                    sd["manning"], sd["flow_accum"], sd["infiltration"],
+                )
+                extra = None
             node_features, _, _ = self.create_node_features(
-                sd["xy_coords"],
-                sd["area"],
-                sd["elevation"],
-                sd["slope"],
-                sd["aspect"],
-                sd["curvature"],
-                sd["manning"],
-                sd["flow_accum"],
-                sd["infiltration"],
+                xy, area, elev, slope, aspect, curv,
+                manning, flow_accum, infilt,
                 dyn["water_depth"][0 : self.n_time_steps, :],
                 dyn["volume"][0 : self.n_time_steps, :],
                 dyn["precipitation"],
                 0,
                 self.n_time_steps,
                 dyn["inflow_hydrograph"],
+                extra_static=extra,
             )
             src, dst = sd["edge_index"]
             edges = torch.stack(
@@ -489,6 +841,16 @@ class UrbanFloodDataset(Dataset):
             g = pyg.data.Data(edge_index=edges)
             g.edge_attr = torch.tensor(sd["edge_features"], dtype=torch.float)
             g.x = torch.tensor(node_features, dtype=torch.float)
+            if self.use_1d:
+                g.node_type = torch.tensor(
+                    np.concatenate(
+                        [
+                            np.zeros(self.num_2d_nodes, dtype=np.int64),
+                            np.ones(self.num_1d_nodes, dtype=np.int64),
+                        ]
+                    ),
+                    dtype=torch.long,
+                )
             rollout_data = {
                 "inflow": torch.tensor(
                     dyn["inflow_hydrograph"][
@@ -773,8 +1135,23 @@ class UrbanFloodDataset(Dataset):
         time_step,
         n_time_steps,
         inflow_hydrograph,
+        extra_static=None,
     ):
-        """Create 16-dim node features. Identical logic to HydroGraphDataset."""
+        """Create node features.
+
+        Layout (when ``extra_static`` is None — original 16-dim 2D-only schema):
+            [xy(2), area, elev, slope, aspect, curv, manning, flow_accum, infilt,
+             inflow, precip, water_depth_window(n), volume_window(n)]
+
+        Layout (when ``extra_static`` is provided — unified 1D+2D schema):
+            [...same first 12 base static dims...,
+             extra_static cols (e.g. depth_1d, invert_elev_1d, base_area_1d, node_type),
+             water_depth_window(n), volume_window(n)]
+
+        Dynamic columns stay at the END of the row in both schemas so callers that
+        slice ``X[:, n_static:]`` still get the dynamic block by computing
+        ``n_static = X.shape[1] - 2 * n_time_steps``.
+        """
         if self.noise_type not in ["none", "pushforward"]:
             window_slice = slice(time_step, time_step + n_time_steps)
             water_depth[window_slice, :] = self.apply_noise_to_feature(
@@ -788,23 +1165,218 @@ class UrbanFloodDataset(Dataset):
             (num_nodes, 1), inflow_hydrograph[time_step]
         )
         precip_current_step = np.full((num_nodes, 1), precipitation_data[time_step])
-        features = np.hstack(
-            [
-                xy_coords,           # 0-1
-                area,                 # 2
-                elevation,            # 3
-                slope,                # 4
-                aspect,               # 5
-                curvature,            # 6
-                manning,              # 7
-                flow_accum,           # 8
-                infiltration,         # 9
-                flow_hydrograph_current_step,  # 10
-                precip_current_step,           # 11
-                water_depth.T,        # 12-(12+n_time_steps-1)
-                volume.T,            # (12+n_time_steps)-(12+2*n_time_steps-1)
-            ]
-        )
+        blocks = [
+            xy_coords,           # 0-1
+            area,                 # 2
+            elevation,            # 3
+            slope,                # 4
+            aspect,               # 5
+            curvature,            # 6
+            manning,              # 7
+            flow_accum,           # 8
+            infiltration,         # 9
+            flow_hydrograph_current_step,  # 10
+            precip_current_step,           # 11
+        ]
+        if extra_static is not None:
+            blocks.append(extra_static)
+        blocks.extend([water_depth.T, volume.T])
+        features = np.hstack(blocks)
         future_inflow = inflow_hydrograph[time_step + n_time_steps]
         future_precip = precipitation_data[time_step + n_time_steps]
         return features, future_inflow, future_precip
+
+    # ------------------------------------------------------------------
+    # 1D system loaders (only used when self.use_1d == True)
+    # ------------------------------------------------------------------
+
+    def load_1d_static_data(self, split_dir, stats):
+        """Load static 1D node data and standardise.
+
+        Standardisation policy: shared scales (xy, elevation) reuse the 2D stats
+        already in ``stats`` so the model sees a single distribution for those
+        columns. 1D-only quantities (depth, base_area) get their own stats keys.
+
+        Returns (xy_1d, depth_1d, invert_elev_1d, surface_elev_1d, base_area_1d,
+                 base_area_1d_denorm, stats).
+        """
+        epsilon = 1e-8
+
+        def standardize_with_key(data, key):
+            """Z-score using stats[key]; create stats[key] from this data if absent."""
+            if key in stats:
+                m = np.array(stats[key]["mean"])
+                s = np.array(stats[key]["std"])
+            else:
+                m = np.mean(data, axis=0)
+                s = np.std(data, axis=0)
+                stats[key] = {"mean": m.tolist(), "std": s.tolist()}
+            return (data - m) / (s + epsilon)
+
+        def standardize_shared(data, shared_key):
+            """Z-score using an existing stats[shared_key] entry (created by 2D pass)."""
+            m = np.array(stats[shared_key]["mean"])
+            s = np.array(stats[shared_key]["std"])
+            return (data - m) / (s + epsilon)
+
+        csv_path = os.path.join(split_dir, "1d_nodes_static.csv")
+        # node_idx, position_x, position_y, depth, invert_elevation,
+        # surface_elevation, base_area
+        raw = np.genfromtxt(
+            csv_path, delimiter=",", skip_header=1, filling_values=np.nan
+        )
+        pos_x = raw[:, 1]
+        pos_y = raw[:, 2]
+        depth = raw[:, 3].reshape(-1, 1)
+        invert_elev = raw[:, 4].reshape(-1, 1)
+        surface_elev = raw[:, 5].reshape(-1, 1)
+        base_area_denorm = raw[:, 6].reshape(-1, 1)
+
+        xy_1d_raw = np.column_stack([pos_x, pos_y])
+        xy_1d = standardize_shared(xy_1d_raw, "xy_coords")           # share with 2D
+        invert_elev_n = standardize_shared(invert_elev, "elevation")  # share scale
+        surface_elev_n = standardize_shared(surface_elev, "elevation")
+        depth_n = standardize_with_key(depth, "depth_1d")
+        base_area_n = standardize_with_key(base_area_denorm.copy(), "base_area_1d")
+
+        return (
+            xy_1d,
+            depth_n,
+            invert_elev_n,
+            surface_elev_n,
+            base_area_n,
+            base_area_denorm,
+            stats,
+        )
+
+    def load_1d_edge_data(self, split_dir):
+        """Load 1D pipe connectivity and per-pipe static features (forward only)."""
+        epsilon = 1e-8
+        ei_path = os.path.join(split_dir, "1d_edge_index.csv")
+        edge_idx_raw = np.genfromtxt(ei_path, delimiter=",", skip_header=1, dtype=int)
+        src_fwd = edge_idx_raw[:, 1]
+        dst_fwd = edge_idx_raw[:, 2]
+
+        es_path = os.path.join(split_dir, "1d_edges_static.csv")
+        # edge_idx, relative_position_x, relative_position_y, length, diameter,
+        # shape, roughness, slope
+        edges_raw = np.genfromtxt(es_path, delimiter=",", skip_header=1)
+        rel_x = edges_raw[:, 1]
+        rel_y = edges_raw[:, 2]
+        length = edges_raw[:, 3]
+        diameter = edges_raw[:, 4]
+        shape = edges_raw[:, 5]
+        roughness = edges_raw[:, 6]
+        slope = edges_raw[:, 7]
+
+        # Z-score within the 1D pipe set (these features have no 2D analog).
+        rel_coords = np.column_stack([rel_x, rel_y])
+        rel_coords = (rel_coords - np.mean(rel_coords, axis=0)) / (
+            np.std(rel_coords, axis=0) + epsilon
+        )
+        length_n = (length - np.mean(length)) / (np.std(length) + epsilon)
+        diameter_n = (diameter - np.mean(diameter)) / (np.std(diameter) + epsilon)
+        # 'shape' is a categorical code; leave as-is (single value usually).
+        roughness_n = (roughness - np.mean(roughness)) / (np.std(roughness) + epsilon)
+        slope_n = (slope - np.mean(slope)) / (np.std(slope) + epsilon)
+
+        edge_features = np.column_stack(
+            [
+                rel_coords[:, 0],
+                rel_coords[:, 1],
+                length_n,
+                diameter_n,
+                shape,
+                roughness_n,
+                slope_n,
+            ]
+        )
+        edge_index = np.array([src_fwd, dst_fwd])
+
+        self.num_1d_fwd_edges = len(src_fwd)
+        logger.info(f"Loaded {len(src_fwd)} 1D pipe edges (forward).")
+        return edge_index, edge_features
+
+    def load_1d2d_connections(self, split_dir):
+        """Load 1D<->2D connection edge index.
+
+        Returns:
+            edge_index:    (2, E_conn) forward only; row 0 = 2D node ids,
+                           row 1 = shifted 1D node ids (local + num_2d_nodes).
+            node_1d_local: (E_conn,)   local 1D node id per connection — used
+                           at runtime to look up per-connection inlet_flow GT.
+        """
+        path = os.path.join(split_dir, "1d2d_connections.csv")
+        raw = np.genfromtxt(path, delimiter=",", skip_header=1, dtype=int)
+        node_1d_local = raw[:, 1]
+        node_2d = raw[:, 2]
+        # Convention: forward edge = 2D -> 1D (water entering inlet).
+        edge_index = np.array([node_2d, node_1d_local + self.num_2d_nodes])
+        logger.info(f"Loaded {edge_index.shape[1]} 1D<->2D connection edges (forward).")
+        return edge_index, node_1d_local
+
+    def load_1d_dynamic_data(self, event_dir, num_1d_nodes, base_area_1d_denorm):
+        """Load dynamic 1D node data and synthesise per-node volume.
+
+        Volume = water_level * base_area (cylindrical-manhole identity, matches
+        what hydraulic solvers like SWMM use internally for junction storage).
+
+        Returns:
+            water_level: (T, N_1d) — m
+            inlet_flow:  (T, N_1d) — m^3/s
+            volume:      (T, N_1d) — m^3 (synthesised)
+        """
+        path = os.path.join(event_dir, "1d_nodes_dynamic_all.csv")
+        # timestep, node_idx, water_level, inlet_flow
+        raw = np.genfromtxt(path, delimiter=",", skip_header=1)
+        T = len(np.unique(raw[:, 0].astype(int)))
+        water_level = raw[:, 2].reshape(T, num_1d_nodes)
+        inlet_flow = raw[:, 3].reshape(T, num_1d_nodes)
+        # base_area_1d_denorm is (N_1d, 1) — broadcast across T.
+        volume = water_level * base_area_1d_denorm.reshape(1, num_1d_nodes)
+        return water_level, inlet_flow, volume
+
+    def load_1d_edge_dynamic_data(self, event_dir, num_1d_edges):
+        """Load dynamic 1D pipe flow data. Returns (T, num_1d_edges) m^3/s."""
+        path = os.path.join(event_dir, "1d_edges_dynamic_all.csv")
+        # timestep, edge_idx, flow, velocity
+        raw = np.genfromtxt(path, delimiter=",", skip_header=1)
+        T = len(np.unique(raw[:, 0].astype(int)))
+        return raw[:, 2].reshape(T, num_1d_edges)
+
+    # ------------------------------------------------------------------
+    # Edge construction helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _bidirect(edge_index_fwd, edge_features_fwd, negate_first_two=True):
+        """Mirror forward edges into reverse edges; optionally negate the first
+        two feature columns (relative-position vector flips sign)."""
+        src, dst = edge_index_fwd
+        edge_index_bi = np.array(
+            [np.concatenate([src, dst]), np.concatenate([dst, src])]
+        )
+        if negate_first_two and edge_features_fwd.shape[1] >= 2:
+            rev = edge_features_fwd.copy()
+            rev[:, 0] = -rev[:, 0]
+            rev[:, 1] = -rev[:, 1]
+        else:
+            rev = edge_features_fwd
+        edge_features_bi = np.vstack([edge_features_fwd, rev])
+        return edge_index_bi, edge_features_bi
+
+    @staticmethod
+    def _connection_edge_features(edge_index_conn_fwd, xy_2d_norm, xy_1d_norm):
+        """Build a 3-col [rel_x, rel_y, length] feature row per forward connection
+        edge. Uses standardised xy positions so values share scale with 2D edges.
+        Indices in edge_index_conn_fwd: row 0 = 2D node ids, row 1 = shifted 1D ids.
+        """
+        eps = 1e-8
+        n_2d = xy_2d_norm.shape[0]
+        e2d = edge_index_conn_fwd[0]
+        e1d_shifted = edge_index_conn_fwd[1]
+        e1d = e1d_shifted - n_2d
+        diff = xy_1d_norm[e1d] - xy_2d_norm[e2d]   # standardised-space displacement
+        length = np.sqrt(np.sum(diff ** 2, axis=1))
+        length_n = (length - np.mean(length)) / (np.std(length) + eps)
+        return np.column_stack([diff[:, 0], diff[:, 1], length_n])

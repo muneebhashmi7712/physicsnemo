@@ -197,6 +197,7 @@ def main(cfg: DictConfig):
     print("Configuration:\n", OmegaConf.to_yaml(cfg))
 
     # Instantiate the test dataset.
+    use_1d = cfg.get("use_1d", False)
     test_dataset = UrbanFloodDataset(
         data_dir=data_dir,
         model_name=model_name,
@@ -204,12 +205,22 @@ def main(cfg: DictConfig):
         n_time_steps=n_time_steps,
         rollout_length=rollout_length,
         return_physics=False,
+        use_1d=use_1d,
     )
     print(f"Loaded test dataset with {len(test_dataset)} events.")
 
     # Normalization stats for denormalization to physical units.
-    wd_mean = test_dataset.dynamic_stats["water_depth"]["mean"]
-    wd_std = test_dataset.dynamic_stats["water_depth"]["std"]
+    # v2: when use_1d, water_depth stats are split per node-type, so we build
+    # a per-node tensor at evaluation time (see below). For the 2D-only path
+    # the legacy scalar mean/std are used directly.
+    wd_stats = test_dataset.dynamic_stats["water_depth"]
+    wd_mean = wd_stats["mean"]   # legacy scalar (== 2D mean when use_1d)
+    wd_std  = wd_stats["std"]    # legacy scalar (== 2D std  when use_1d)
+    if use_1d:
+        wd_mean_2d = wd_stats["2d"]["mean"]
+        wd_std_2d  = wd_stats["2d"]["std"]
+        wd_mean_1d = wd_stats["1d"]["mean"]
+        wd_std_1d  = wd_stats["1d"]["std"]
     elev_mean_raw = test_dataset.static_stats["elevation"]["mean"]
     elev_std_raw = test_dataset.static_stats["elevation"]["std"]
     # Static stats may be stored as single-element lists.
@@ -253,34 +264,65 @@ def main(cfg: DictConfig):
     model.eval()
 
     all_rmse_all = []
+    all_rmse_2d = []   # per-event RMSE on 2D nodes only (use_1d case)
+    all_rmse_1d = []   # per-event RMSE on 1D nodes only (use_1d case)
 
     # Loop over each test event.
     for idx in range(len(test_dataset)):
         g, rollout_data = test_dataset[idx]
         g = g.to(device)
         edge_features = g.edge_attr.to(device)
-        X_current = g.x.to(device)  # Expected shape: [num_nodes, 16]
+        X_current = g.x.to(device)
         num_nodes = X_current.size(0)
+        node_type = (
+            g.node_type.to(device) if hasattr(g, "node_type") else None
+        )  # 0 = 2D, 1 = 1D
 
         rollout_preds = []
         ground_truth_list = []
         rmse_list = []
+        rmse_2d_list = []
+        rmse_1d_list = []
 
         inflow_seq = rollout_data["inflow"].to(device)
         precip_seq = rollout_data["precipitation"].to(device)
         wd_gt_seq = rollout_data["water_depth_gt"].to(device)
 
-        # Denormalize ground elevation for water depth above ground.
-        elev_norm = X_current[:, 3]  # normalized elevation, column 3
+        # Denormalize "elevation" column (column 3) for surface depth computation.
+        # In use_1d schema, this column is ground_elev for 2D rows and
+        # surface_elev_1d for 1D rows — both standardised with the SAME stats
+        # so denormalising recovers each node's relevant surface elevation.
+        elev_norm = X_current[:, 3]
         elev_real = elev_norm * (elev_std + epsilon) + elev_mean
+
+        # v2: build per-node water-depth (mean, std) tensors. For 2D-only
+        # runs these collapse to scalar broadcasts of the legacy values.
+        if use_1d and node_type is not None:
+            is_1d = (node_type == 1)
+            wd_mean_per_node = torch.where(
+                is_1d,
+                torch.tensor(wd_mean_1d, device=device, dtype=X_current.dtype),
+                torch.tensor(wd_mean_2d, device=device, dtype=X_current.dtype),
+            )
+            wd_std_per_node = torch.where(
+                is_1d,
+                torch.tensor(wd_std_1d, device=device, dtype=X_current.dtype),
+                torch.tensor(wd_std_2d, device=device, dtype=X_current.dtype),
+            )
+        else:
+            wd_mean_per_node = wd_mean
+            wd_std_per_node  = wd_std
+
+        # Determine the static block width once. The dynamic block (water_depth
+        # window + volume window) is always at the END of the row, so:
+        n_static = X_current.size(1) - 2 * n_time_steps
 
         X_iter = X_current.clone()
 
         for t in range(rollout_length):
-            # Split into static and dynamic parts.
-            static_part = X_iter[:, :12]
-            water_depth_window = X_iter[:, 12 : 12 + n_time_steps]
-            volume_window = X_iter[:, 12 + n_time_steps : 12 + 2 * n_time_steps]
+            static_part = X_iter[:, :n_static]
+            water_depth_window = X_iter[:, n_static : n_static + n_time_steps]
+            volume_window = X_iter[:, n_static + n_time_steps : n_static + 2 * n_time_steps]
 
             X_input = torch.cat(
                 [static_part, water_depth_window, volume_window], dim=1
@@ -298,7 +340,8 @@ def main(cfg: DictConfig):
             )
             volume_updated = torch.cat([volume_window[:, 1:], new_vol], dim=1)
 
-            # Update static part: inflow (col 10) and precip (col 11).
+            # Update static part: inflow at col 10, precip at col 11
+            # (positions are constant in both schemas; static block is just wider).
             new_flow = inflow_seq[t].unsqueeze(0).expand(num_nodes, 1)
             new_precip = precip_seq[t].unsqueeze(0).expand(num_nodes, 1)
             static_part_updated = static_part.clone()
@@ -308,9 +351,11 @@ def main(cfg: DictConfig):
                 [static_part_updated, water_depth_updated, volume_updated], dim=1
             )
 
-            # Denormalize to physical water level and compute depth above ground.
-            pred_wl = new_wd.squeeze(1) * (wd_std + epsilon) + wd_mean
-            gt_wl = wd_gt_seq[t] * (wd_std + epsilon) + wd_mean
+            # Denormalize to physical water level and compute depth above the
+            # relevant surface (ground for 2D, manhole rim for 1D). Per-node
+            # mean/std handles per-type stats under use_1d.
+            pred_wl = new_wd.squeeze(1) * (wd_std_per_node + epsilon) + wd_mean_per_node
+            gt_wl   = wd_gt_seq[t]      * (wd_std_per_node + epsilon) + wd_mean_per_node
             pred_depth = torch.clamp(pred_wl - elev_real, min=0.0)
             gt_depth = torch.clamp(gt_wl - elev_real, min=0.0)
 
@@ -322,10 +367,37 @@ def main(cfg: DictConfig):
             ).item()
             rmse_list.append(rmse)
 
+            if node_type is not None:
+                m2 = node_type == 0
+                m1 = node_type == 1
+                if m2.any():
+                    rmse_2d_list.append(
+                        torch.sqrt(
+                            torch.mean((pred_depth[m2] - gt_depth[m2]) ** 2)
+                        ).item()
+                    )
+                if m1.any():
+                    rmse_1d_list.append(
+                        torch.sqrt(
+                            torch.mean((pred_depth[m1] - gt_depth[m1]) ** 2)
+                        ).item()
+                    )
+
         all_rmse_all.append(rmse_list)
+        if rmse_2d_list:
+            all_rmse_2d.append(rmse_2d_list)
+        if rmse_1d_list:
+            all_rmse_1d.append(rmse_1d_list)
         mean_rmse_sample = sum(rmse_list) / len(rmse_list)
         sample_id = test_dataset.dynamic_data[idx].get("event_id", idx)
-        print(f"Event {sample_id}: Mean RMSE = {mean_rmse_sample:.4f} m")
+        if rmse_2d_list and rmse_1d_list:
+            print(
+                f"Event {sample_id}: Mean RMSE = {mean_rmse_sample:.4f} m | "
+                f"2D = {sum(rmse_2d_list)/len(rmse_2d_list):.4f} m | "
+                f"1D = {sum(rmse_1d_list)/len(rmse_1d_list):.4f} m"
+            )
+        else:
+            print(f"Event {sample_id}: Mean RMSE = {mean_rmse_sample:.4f} m")
 
         anim_filename = os.path.join(anim_output_dir, f"animation_{sample_id}.gif")
         create_animation(rollout_preds, ground_truth_list, g, rmse_list, anim_filename)
@@ -335,6 +407,14 @@ def main(cfg: DictConfig):
     overall_std_rmse = torch.std(all_rmse_tensor, dim=0)
     print("Overall Mean RMSE (m) over rollout steps:", overall_mean_rmse)
     print("Overall Std RMSE (m) over rollout steps:", overall_std_rmse)
+
+    if all_rmse_2d and all_rmse_1d:
+        m2 = torch.tensor(all_rmse_2d)
+        m1 = torch.tensor(all_rmse_1d)
+        print("Overall Mean RMSE — 2D nodes:", torch.mean(m2, dim=0))
+        print("Overall Std  RMSE — 2D nodes:", torch.std(m2, dim=0))
+        print("Overall Mean RMSE — 1D nodes:", torch.mean(m1, dim=0))
+        print("Overall Std  RMSE — 1D nodes:", torch.std(m1, dim=0))
 
     # 5 minutes per step for UrbanFlood.
     timesteps = [(i + 1) * (5 / 60) for i in range(rollout_length)]

@@ -154,21 +154,25 @@ def compute_local_conservation_loss(
     """
     Compute per-node local mass conservation loss (adapted from DualFloodGNN Eq. 18).
 
-    Reconstructs absolute flow Q = Q_prev + delta_Q_pred, then checks that
-    the predicted volume change at each node equals the net flow plus the
-    ground-truth source term S_gt.
+    Reconstructs absolute flow Q = Q_prev + delta_Q_pred, denormalises both
+    predicted volume changes and edge flows to physical units (m³ per step),
+    forms the residual ΔV − (net_flow + S_gt) in physical units, and divides
+    by the per-node volume std so each node-type contributes a comparable
+    magnitude regardless of its absolute volume scale.
 
-    S_gt is precomputed in the dataset as delta_V_gt - net_flow_gt, implicitly
-    capturing rainfall, infiltration, and any other external forcing that
-    inter-cell flows do not explain.
+    v2 (1D-coupling): when the dataset stores per-type stats, the graph
+    carries `V_std_per_node` and `Q_sigma_per_edge_phys` (both in m³); for
+    the legacy 2D-only path these tensors collapse to a single shared std
+    so the loss reduces to the v1/v5 formulation bit-identically.
 
-    L_local = mean_i |delta_V_i - (net_flow_i + S_gt_i)|
+    L_local = mean_i | (ΔV_phys_i − net_flow_phys_i − S_phys_i) / V_std_per_node_i |
 
     Args:
         node_pred (torch.Tensor): Node predictions [N, 2] (delta_depth, delta_volume).
-        edge_pred (torch.Tensor): Edge predictions [E, 1] (delta-Q in normalized vol/step).
-        graph (PyGData): Batched PyG graph with edge_index, edge_q_prev, and
-            source_term attributes.
+        edge_pred (torch.Tensor): Edge predictions [E, 1] (delta-Q normalised
+            per edge by `Q_sigma_per_edge_phys`).
+        graph (PyGData): Batched PyG graph with edge_index, edge_q_prev,
+            source_term, V_std_per_node, and Q_sigma_per_edge_phys attributes.
         physics_data (dict): Physics parameters (unused, kept for API compatibility).
         delta_t (float): Time step in seconds (unused, kept for API compatibility).
 
@@ -178,30 +182,31 @@ def compute_local_conservation_loss(
     device = node_pred.device
     num_nodes = node_pred.shape[0]
 
-    # delta_V in normalized volume space (model output).
-    delta_V = node_pred[:, 1]
+    V_std_per_node     = graph.V_std_per_node.to(device)              # [N], m³
+    Q_sigma_per_edge   = graph.Q_sigma_per_edge_phys.to(device)       # [E], m³
 
-    # Reconstruct absolute Q from Q_prev + delta_Q_pred.
-    # Both in normalized volume per step units.
-    Q_pred = graph.edge_q_prev + edge_pred.squeeze(-1)
+    # ΔV in physical m³.
+    delta_V_phys = node_pred[:, 1] * V_std_per_node
 
-    # Scatter Q into per-node inflow and outflow.
-    # With bidirectional edges (forward + negated reverse), each physical flow
-    # contributes twice to the scatter, so divide by 2 to correct.
+    # Q in physical m³/step. edge_q_prev / edge_pred are normalised by the
+    # per-edge sigma which already includes delta_t.
+    Q_pred_phys = (graph.edge_q_prev + edge_pred.squeeze(-1)) * Q_sigma_per_edge
+
     edge_index = graph.edge_index  # [2, E]
-    Q_in = torch.zeros(num_nodes, device=device)
-    Q_in.scatter_add_(0, edge_index[1], Q_pred)
-    Q_out = torch.zeros(num_nodes, device=device)
-    Q_out.scatter_add_(0, edge_index[0], Q_pred)
-    net_flow = (Q_in - Q_out) / 2.0
+    Q_in_phys  = torch.zeros(num_nodes, device=device, dtype=Q_pred_phys.dtype)
+    Q_in_phys.scatter_add_(0, edge_index[1], Q_pred_phys)
+    Q_out_phys = torch.zeros(num_nodes, device=device, dtype=Q_pred_phys.dtype)
+    Q_out_phys.scatter_add_(0, edge_index[0], Q_pred_phys)
+    # Bidirectional edges: forward + (negated) reverse pair → /2 to recover
+    # the physical net flow.
+    net_flow_phys = (Q_in_phys - Q_out_phys) / 2.0
 
-    # Use precomputed ground-truth source term (captures rainfall, infiltration,
-    # boundary effects -- everything not explained by inter-cell flows).
-    S_gt = graph.source_term.to(device)
+    # S_gt was stored as S_phys / V_std_per_node (dimensionless).
+    S_phys = graph.source_term.to(device) * V_std_per_node
 
-    # Per-node residual.
-    residual = delta_V - (net_flow + S_gt)
-    return residual.abs().mean()
+    residual_phys = delta_V_phys - (net_flow_phys + S_phys)            # m³
+
+    return (residual_phys / V_std_per_node).abs().mean()
 
 
 def custom_loss(pred, targets):

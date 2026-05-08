@@ -44,6 +44,20 @@ use_physics_loss: false
 delta_t: 300.0              # 5 minutes in seconds.
 physics_loss_weight: 0.0
 
+# Local conservation losses (DualFloodGNN-style, off by default).
+# Override these at runtime via the train script. Declared here so Hydra's
+# struct-mode override checks accept them.
+use_local_physics_loss: false
+local_physics_loss_weight: 0.1
+edge_loss_weight: 1.0
+
+# 1D drainage system + 1D-2D coupling (Phase 2).
+# When true, num_input_features must be set to 20 (12 base + 4 extras +
+# 2*n_time_steps dynamic) and num_edge_features to 10 (3 shared + 4 1D-specific
+# + 3-col edge_type one-hot). Override at runtime via the v1 train script —
+# the defaults below stay 2D-only so existing v5 runs reproduce byte-for-byte.
+use_1d: false
+
 # Performance and optimization configurations.
 use_apex: True
 amp: False
