@@ -27,6 +27,7 @@ For each test event, generates a four-panel animation:
 """
 
 import os
+import numpy as np
 import torch
 import hydra
 import networkx as nx
@@ -198,6 +199,8 @@ def main(cfg: DictConfig):
 
     # Instantiate the test dataset.
     use_1d = cfg.get("use_1d", False)
+    static_prediction = bool(cfg.get("static_prediction", False))
+    edge_q_prev_as_input = bool(cfg.get("edge_q_prev_as_input", False))
     test_dataset = UrbanFloodDataset(
         data_dir=data_dir,
         model_name=model_name,
@@ -206,6 +209,9 @@ def main(cfg: DictConfig):
         rollout_length=rollout_length,
         return_physics=False,
         use_1d=use_1d,
+        edge_q_prev_as_input=bool(cfg.get("edge_q_prev_as_input", False)),
+        lmc_antisymmetric=bool(cfg.get("lmc_antisymmetric", False)),
+        static_prediction=static_prediction,
     )
     print(f"Loaded test dataset with {len(test_dataset)} events.")
 
@@ -246,7 +252,10 @@ def main(cfg: DictConfig):
         num_harmonics=cfg.get("num_harmonics", 5),
     )
     if use_local_physics_loss:
-        model = HydroGraphKANWithEdgeDecoder(**model_args)
+        model = HydroGraphKANWithEdgeDecoder(
+            **model_args,
+            concat_endpoints=bool(cfg.get("edge_decoder_concat_endpoints", False)),
+        )
     else:
         model = MeshGraphKAN(**model_args)
     model.to(device)
@@ -262,6 +271,78 @@ def main(cfg: DictConfig):
     )
     print(f"Checkpoint loaded from epoch {epoch_loaded}")
     model.eval()
+
+    # ------------------------------------------------------------------
+    # v9: time-less peak-depth prediction — one forward pass per event.
+    # Emits per-event + summary lines in the exact v8 log format so the
+    # existing aggregator parses it unchanged (summary as 1-element tensors).
+    # ------------------------------------------------------------------
+    if static_prediction:
+        pd_stats = test_dataset.dynamic_stats["peak_depth"]
+        ev_2d, ev_1d, ev_all = [], [], []
+        with torch.no_grad():
+            for idx in range(len(test_dataset)):
+                g, meta = test_dataset[idx]
+                g = g.to(device)
+                node_type = g.node_type.to(device) if hasattr(g, "node_type") else None
+                out = model(g.x.to(device), g.edge_attr.to(device), g)
+                pred = out[0] if isinstance(out, tuple) else out  # (N, 1)
+                pred = pred.squeeze(-1)
+
+                if use_1d and node_type is not None:
+                    is_1d = (node_type == 1)
+                    mean_pn = torch.where(
+                        is_1d,
+                        torch.tensor(pd_stats["1d"]["mean"], device=device, dtype=pred.dtype),
+                        torch.tensor(pd_stats["2d"]["mean"], device=device, dtype=pred.dtype),
+                    )
+                    std_pn = torch.where(
+                        is_1d,
+                        torch.tensor(pd_stats["1d"]["std"], device=device, dtype=pred.dtype),
+                        torch.tensor(pd_stats["2d"]["std"], device=device, dtype=pred.dtype),
+                    )
+                else:
+                    mean_pn = pd_stats["mean"]
+                    std_pn = pd_stats["std"]
+
+                pred_phys = torch.clamp(pred * (std_pn + epsilon) + mean_pn, min=0.0)
+                gt_phys = meta["peak_depth_phys"].to(device)
+
+                rmse = torch.sqrt(torch.mean((pred_phys - gt_phys) ** 2)).item()
+                ev_all.append(rmse)
+                sample_id = meta["event_id"]
+                if node_type is not None:
+                    m2 = node_type == 0
+                    m1 = node_type == 1
+                    r2 = torch.sqrt(torch.mean((pred_phys[m2] - gt_phys[m2]) ** 2)).item()
+                    r1 = torch.sqrt(torch.mean((pred_phys[m1] - gt_phys[m1]) ** 2)).item()
+                    ev_2d.append(r2)
+                    ev_1d.append(r1)
+                    print(
+                        f"Event {sample_id}: Mean RMSE = {rmse:.4f} m | "
+                        f"2D = {r2:.4f} m | 1D = {r1:.4f} m"
+                    )
+                else:
+                    print(f"Event {sample_id}: Mean RMSE = {rmse:.4f} m")
+
+        # Summary as 1-element tensors (peak-depth has no rollout dimension).
+        mean_all = sum(ev_all) / len(ev_all)
+        print(
+            "Overall Mean RMSE (m) over rollout steps:",
+            torch.tensor([mean_all]),
+        )
+        print("Overall Std RMSE (m) over rollout steps:", torch.tensor([float(np.std(ev_all))]))
+        if ev_2d:
+            print("Overall Mean RMSE — 2D nodes:", torch.tensor([sum(ev_2d) / len(ev_2d)]))
+            print("Overall Std  RMSE — 2D nodes:", torch.tensor([float(np.std(ev_2d))]))
+            print("Overall Mean RMSE — 1D nodes:", torch.tensor([sum(ev_1d) / len(ev_1d)]))
+            print("Overall Std  RMSE — 1D nodes:", torch.tensor([float(np.std(ev_1d))]))
+        else:
+            # 2D-only run: surface line is the same as overall.
+            print("Overall Mean RMSE — 2D nodes:", torch.tensor([mean_all]))
+            print("Overall Std  RMSE — 2D nodes:", torch.tensor([float(np.std(ev_all))]))
+        print(f"Static peak-depth inference done over {len(ev_all)} events.")
+        return
 
     all_rmse_all = []
     all_rmse_2d = []   # per-event RMSE on 2D nodes only (use_1d case)
@@ -333,6 +414,16 @@ def main(cfg: DictConfig):
             pred = out[0] if isinstance(out, tuple) else out  # shape: (num_nodes, 2)
             new_wd = water_depth_window[:, -1:] + pred[:, 0:1]
             new_vol = volume_window[:, -1:] + pred[:, 1:2]
+
+            # Change B.3: autoregressive Q rollout. The 11th edge_attr column
+            # holds normalised Q_prev; update it with the predicted ΔQ so the
+            # next step sees Q_pred[t] = Q_prev[t-1] + ΔQ_pred (DUALFloodGNN
+            # autoregressive flow rollout, doc §9.5 option 1). The first-step
+            # value comes from GT at the last warmup step (dataset B.2).
+            if edge_q_prev_as_input and isinstance(out, tuple) and len(out) > 1:
+                edge_pred = out[1].squeeze(-1)  # [E]
+                edge_features = edge_features.clone()
+                edge_features[:, -1] = edge_features[:, -1] + edge_pred
 
             # Update dynamic window.
             water_depth_updated = torch.cat(

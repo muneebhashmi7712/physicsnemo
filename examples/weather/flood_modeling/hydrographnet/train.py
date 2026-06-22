@@ -47,7 +47,12 @@ from physicsnemo.utils.logging.wandb import initialize_wandb
 from physicsnemo.utils import load_checkpoint, save_checkpoint
 from physicsnemo.models.meshgraphnet.meshgraphkan import MeshGraphKAN
 from model import HydroGraphKANWithEdgeDecoder
-from utils import compute_physics_loss, compute_local_conservation_loss, compute_edge_flow_loss
+from utils import (
+    compute_physics_loss,
+    compute_local_conservation_loss,
+    compute_edge_flow_loss,
+    compute_steady_state_conservation_loss,
+)
 
 
 # Custom collate function that checks if each item is a tuple (graph, physics_data) or a plain graph.
@@ -83,9 +88,20 @@ class MGNTrainer:
         self.use_local_physics_loss = cfg.get("use_local_physics_loss", False)
         self.local_physics_loss_weight = cfg.get("local_physics_loss_weight", 0.1)
         self.edge_loss_weight = cfg.get("edge_loss_weight", 1.0)
+        # Bundle knobs ported from White-River v7-R1.
+        self.local_loss_warmup_epochs = int(cfg.get("local_loss_warmup_epochs", 0))
+        self.local_loss_smooth_l1_beta = float(cfg.get("local_loss_smooth_l1_beta", 0.0))
+        self.lc_apply_boundary_mask = bool(cfg.get("compute_boundary_mask", False))
+        self.lc_restrict_to_2d = bool(cfg.get("restrict_lc_to_2d", False))
+        self.lc_node_type_weighting = str(cfg.get("lmc_node_type_weighting", "none"))
+        # Set per-epoch from the main loop. Linear ramp [0, 1] over the
+        # warmup window. With warmup_epochs=0 this is always 1.0 (no ramp).
+        self.lc_eff_weight = self.local_physics_loss_weight
 
         # 1D coupling toggle.
         self.use_1d = cfg.get("use_1d", False)
+        # v9: time-less peak-depth prediction (single forward pass, no rollout).
+        self.static_prediction = bool(cfg.get("static_prediction", False))
         self.n_time_steps = cfg.n_time_steps
         # The dynamic block in graph.x has 2 * window_size columns (one half
         # water_depth, the other volume). With pushforward noise the dataset
@@ -93,6 +109,18 @@ class MGNTrainer:
         self.dynamic_window = self.n_time_steps + (
             1 if cfg.noise_type == "pushforward" else 0
         )
+
+        # ---- LMC bundle v5: multi-step rollout training (DUALFloodGNN) -----
+        # `rollout_curriculum` is a list of (epoch_start, O) pairs, e.g.
+        # [[0, 1], [12, 2], [25, 4], [37, 8]]. The trainer derives the maximum
+        # O across the schedule and asks the dataset for that many consecutive
+        # GT steps per sample. The current `curriculum_O` is set per-epoch by
+        # the main loop and controls how many rollout steps the train loop
+        # actually unrolls. When the max O across the schedule is 1, the
+        # legacy pushforward branch is used and behavior is unchanged.
+        self.rollout_curriculum = list(cfg.get("rollout_curriculum", [[0, 1]]))
+        self.train_rollout_length = max(int(o) for _, o in self.rollout_curriculum)
+        self.curriculum_O = 1  # set per-epoch by main loop
 
         # Set activation function.
         mlp_act = "relu"
@@ -115,6 +143,12 @@ class MGNTrainer:
             return_physics=self.use_physics_loss or self.use_local_physics_loss,
             delta_t=self.delta_t,
             use_1d=self.use_1d,
+            compute_boundary_mask=self.lc_apply_boundary_mask,
+            mask_inlets_in_lc=bool(cfg.get("mask_inlets_in_lc", False)),
+            edge_q_prev_as_input=bool(cfg.get("edge_q_prev_as_input", False)),
+            lmc_antisymmetric=bool(cfg.get("lmc_antisymmetric", False)),
+            train_rollout_length=self.train_rollout_length,
+            static_prediction=self.static_prediction,
         )
         sampler = DistributedSampler(
             dataset,
@@ -156,7 +190,12 @@ class MGNTrainer:
             rank_zero_logger.info(
                 "Instantiating HydroGraphKANWithEdgeDecoder model..."
             )
-            self.model = HydroGraphKANWithEdgeDecoder(**model_args)
+            self.model = HydroGraphKANWithEdgeDecoder(
+                **model_args,
+                concat_endpoints=bool(
+                    cfg.get("edge_decoder_concat_endpoints", False)
+                ),
+            )
         else:
             rank_zero_logger.info("Instantiating MeshGraphKAN model...")
             self.model = MeshGraphKAN(**model_args)
@@ -247,7 +286,174 @@ class MGNTrainer:
             return out  # (node_pred, edge_pred)
         return out, None  # node_pred, None
 
+    def _forward_multistep(self, graph, physics_data):
+        """Multi-step autoregressive rollout training (DUALFloodGNN regime).
+
+        Unrolls `self.curriculum_O` steps with full backprop through the
+        rollout. At each step, the per-step prediction loss, edge loss
+        (when LMC is on), and local mass conservation loss are computed
+        against the per-step GT targets stacked into the sample. State
+        (water_depth/volume window + edge_q_prev) is updated
+        autoregressively from the model's own predictions, mirroring the
+        inference rollout in inference.py:328-368.
+        """
+        with autocast(device_type=self.dist.device.type, enabled=self.amp):
+            X = graph.x
+            n_time = self.dynamic_window
+            n_static = X.shape[1] - 2 * n_time
+            static_part = X[:, :n_static]
+            water_depth_full = X[:, n_static : n_static + n_time]
+            volume_full = X[:, n_static + n_time : n_static + 2 * n_time]
+
+            # Initial input window = last n_time_steps cols (matches the
+            # one_step branch of the legacy pushforward path). For
+            # n_time_steps=2 + pushforward, water_depth_full is 3 cols and
+            # this takes cols 1..2 (drop the leading pushforward column).
+            water_depth_window = water_depth_full[:, 1:]
+            volume_window = volume_full[:, 1:]
+            # Initial absolute Q (normalised, per-edge) from GT — only
+            # available when LMC / edge supervision is on; the dataset only
+            # populates `g.edge_q_prev` under `return_physics=True`.
+            edge_q_running = (
+                graph.edge_q_prev if self.use_local_physics_loss else None
+            )
+
+            O = max(1, int(self.curriculum_O))
+            assert O <= self.train_rollout_length, (
+                f"curriculum_O={O} exceeds dataset train_rollout_length="
+                f"{self.train_rollout_length}"
+            )
+
+            # Save originals so we can restore the graph for downstream calls
+            # (PyG mutates in-place; this is for safety).
+            orig_source_term = getattr(graph, "source_term", None)
+            orig_edge_q_prev = getattr(graph, "edge_q_prev", None)
+
+            loss_total = torch.zeros((), device=self.dist.device, dtype=X.dtype)
+            comp = {
+                "pred_loss": 0.0,
+                "edge_loss": 0.0,
+                "local_physics_loss": 0.0,
+            }
+
+            for o in range(O):
+                # Wire per-step state into the graph for LMC residual
+                # (only meaningful when LMC is on).
+                if self.use_local_physics_loss:
+                    graph.edge_q_prev = edge_q_running
+                    if hasattr(graph, "source_term_rollout"):
+                        graph.source_term = graph.source_term_rollout[:, o]
+
+                X_o = torch.cat(
+                    [static_part, water_depth_window, volume_window], dim=1
+                )
+                node_pred, edge_pred = self._call_model(
+                    X_o, graph.edge_attr, graph
+                )
+
+                # Per-step targets (slice from rollout stacks).
+                y_o = graph.y_rollout[:, o, :]
+                pred_loss = self.criterion(node_pred, y_o)
+                step_loss = pred_loss
+                comp["pred_loss"] += pred_loss.detach().item()
+
+                if self.use_local_physics_loss and edge_pred is not None:
+                    edge_y_o = graph.edge_y_rollout[:, o, :]
+                    edge_loss_o = compute_edge_flow_loss(
+                        edge_pred, graph, edge_y_target=edge_y_o
+                    )
+                    lmc_loss_o = compute_local_conservation_loss(
+                        node_pred, edge_pred, graph, physics_data,
+                        delta_t=self.delta_t,
+                        smooth_l1_beta=self.local_loss_smooth_l1_beta,
+                        apply_boundary_mask=self.lc_apply_boundary_mask,
+                        restrict_to_2d=self.lc_restrict_to_2d,
+                        node_type_weighting=self.lc_node_type_weighting,
+                    )
+                    step_loss = (
+                        step_loss
+                        + self.edge_loss_weight * edge_loss_o
+                        + self.lc_eff_weight * lmc_loss_o
+                    )
+                    comp["edge_loss"] += edge_loss_o.detach().item()
+                    comp["local_physics_loss"] += lmc_loss_o.detach().item()
+
+                loss_total = loss_total + step_loss
+
+                # Autoregressive state update (unless this was the last step).
+                if o < O - 1:
+                    new_wd = water_depth_window[:, -1:] + node_pred[:, 0:1]
+                    new_vol = volume_window[:, -1:] + node_pred[:, 1:2]
+                    water_depth_window = torch.cat(
+                        [water_depth_window[:, 1:], new_wd], dim=1
+                    )
+                    volume_window = torch.cat(
+                        [volume_window[:, 1:], new_vol], dim=1
+                    )
+                    if edge_pred is not None:
+                        edge_q_running = edge_q_running + edge_pred.squeeze(-1)
+
+            # DUALFloodGNN Eq. 25: average loss over the rollout horizon.
+            loss_total = loss_total / O
+
+            # Restore graph attrs (defensive — next batch creates a fresh PyG batch).
+            if orig_edge_q_prev is not None:
+                graph.edge_q_prev = orig_edge_q_prev
+            if orig_source_term is not None:
+                graph.source_term = orig_source_term
+
+            loss_dict = {
+                "total_loss": loss_total,
+                "pred_loss": torch.tensor(comp["pred_loss"] / O, device=self.dist.device),
+            }
+            if self.use_local_physics_loss:
+                loss_dict["edge_loss"] = torch.tensor(
+                    comp["edge_loss"] / O, device=self.dist.device
+                )
+                loss_dict["local_physics_loss"] = torch.tensor(
+                    comp["local_physics_loss"] / O, device=self.dist.device
+                )
+        return loss_total, loss_dict
+
+    def _forward_static(self, graph, physics_data):
+        """v9 time-less peak-depth training: one forward pass per event.
+
+        Loss = MSE(peak depth) + optional steady-state mass-conservation
+        regularizer. No rollout, no edge supervision (no GT ΔQ at the peak —
+        the edge head is trained purely through the conservation residual).
+        """
+        with autocast(device_type=self.dist.device.type, enabled=self.amp):
+            node_pred, edge_pred = self._call_model(
+                graph.x, graph.edge_attr, graph
+            )
+            mse_loss = self.criterion(node_pred, graph.y)
+            loss = mse_loss
+            loss_dict = {"total_loss": loss, "mse_loss": mse_loss}
+            if self.use_local_physics_loss and edge_pred is not None:
+                lmc_loss = compute_steady_state_conservation_loss(
+                    node_pred, edge_pred, graph,
+                    smooth_l1_beta=self.local_loss_smooth_l1_beta,
+                    apply_boundary_mask=self.lc_apply_boundary_mask,
+                    restrict_to_2d=self.lc_restrict_to_2d,
+                    node_type_weighting=self.lc_node_type_weighting,
+                )
+                loss = loss + self.lc_eff_weight * lmc_loss
+                loss_dict["local_physics_loss"] = lmc_loss
+                loss_dict["total_loss"] = loss
+        return loss, loss_dict
+
     def forward(self, graph, physics_data):
+        # v9: time-less peak-depth prediction (single forward pass).
+        if self.static_prediction:
+            return self._forward_static(graph, physics_data)
+        # Multi-step rollout training (LMC bundle v5 / DUALFloodGNN regime).
+        # When the curriculum schedule has any O > 1, the dataset provides
+        # stacked GT targets for O consecutive future steps and the trainer
+        # unrolls `self.curriculum_O` autoregressive steps with full backprop
+        # through the rollout. The legacy pushforward path is preserved
+        # untouched for runs whose schedule is `[[0, 1]]`.
+        if self.train_rollout_length > 1:
+            return self._forward_multistep(graph, physics_data)
         if self.noise_type == "pushforward":
             with autocast(device_type=self.dist.device.type, enabled=self.amp):
                 X = graph.x
@@ -320,17 +526,25 @@ class MGNTrainer:
                     edge_loss = edge_loss_one + edge_loss_stab
                     loss = loss + self.edge_loss_weight * edge_loss
                     loss_dict["edge_loss"] = edge_loss
-                    # Local conservation (ℒ_local).
+                    # Local conservation (ℒ_local) with bundle knobs.
                     local_loss_one = compute_local_conservation_loss(
                         pred_one, edge_pred_one, graph, physics_data,
                         delta_t=self.delta_t,
+                        smooth_l1_beta=self.local_loss_smooth_l1_beta,
+                        apply_boundary_mask=self.lc_apply_boundary_mask,
+                        restrict_to_2d=self.lc_restrict_to_2d,
+                        node_type_weighting=self.lc_node_type_weighting,
                     )
                     local_loss_stab = compute_local_conservation_loss(
                         pred_stab2, edge_pred_stab2, graph, physics_data,
                         delta_t=self.delta_t,
+                        smooth_l1_beta=self.local_loss_smooth_l1_beta,
+                        apply_boundary_mask=self.lc_apply_boundary_mask,
+                        restrict_to_2d=self.lc_restrict_to_2d,
+                        node_type_weighting=self.lc_node_type_weighting,
                     )
                     local_loss = local_loss_one + local_loss_stab
-                    loss = loss + self.local_physics_loss_weight * local_loss
+                    loss = loss + self.lc_eff_weight * local_loss
                     loss_dict["local_physics_loss"] = local_loss
             return loss, loss_dict
         else:
@@ -354,8 +568,12 @@ class MGNTrainer:
                     local_loss = compute_local_conservation_loss(
                         pred, edge_pred, graph, physics_data,
                         delta_t=self.delta_t,
+                        smooth_l1_beta=self.local_loss_smooth_l1_beta,
+                        apply_boundary_mask=self.lc_apply_boundary_mask,
+                        restrict_to_2d=self.lc_restrict_to_2d,
+                        node_type_weighting=self.lc_node_type_weighting,
                     )
-                    loss = loss + self.local_physics_loss_weight * local_loss
+                    loss = loss + self.lc_eff_weight * local_loss
                     loss_dict["local_physics_loss"] = local_loss
             return loss, loss_dict
 
@@ -391,13 +609,36 @@ def main(cfg: DictConfig) -> None:
     # Track loss history for plotting.
     loss_history = {"total_loss": []}
     component_keys = [
-        "loss_one", "loss_stability", "mse_loss",
+        "loss_one", "loss_stability", "mse_loss", "pred_loss",
         "physics_loss", "edge_loss", "local_physics_loss",
     ]
     for key in component_keys:
         loss_history[key] = []
 
+    def _curriculum_O_for_epoch(epoch_idx: int) -> int:
+        """Pick the largest O whose epoch_start <= epoch_idx in the schedule."""
+        chosen = 1
+        for start, O_val in trainer.rollout_curriculum:
+            if int(start) <= epoch_idx:
+                chosen = int(O_val)
+        return chosen
+
     for epoch in range(trainer.epoch_init, cfg.epochs):
+        # Linear warmup for the local-conservation weight. With
+        # warmup_epochs=0 the ramp factor stays at 1.0 (no ramp).
+        if trainer.local_loss_warmup_epochs > 0:
+            ramp = min(epoch / trainer.local_loss_warmup_epochs, 1.0)
+        else:
+            ramp = 1.0
+        trainer.lc_eff_weight = ramp * trainer.local_physics_loss_weight
+        # Pick the curriculum rollout horizon for this epoch (LMC bundle v5).
+        trainer.curriculum_O = _curriculum_O_for_epoch(epoch)
+        rank_zero_logger.info(
+            f"Epoch {epoch}: lc_eff_weight={trainer.lc_eff_weight:.4e} "
+            f"(ramp={ramp:.2f}, λ={trainer.local_physics_loss_weight}) | "
+            f"curriculum_O={trainer.curriculum_O}"
+        )
+
         epoch_loss = 0.0
         epoch_components = {k: 0.0 for k in component_keys}
         num_batches = 0

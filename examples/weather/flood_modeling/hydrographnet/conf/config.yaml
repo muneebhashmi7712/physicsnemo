@@ -51,12 +51,69 @@ use_local_physics_loss: false
 local_physics_loss_weight: 0.1
 edge_loss_weight: 1.0
 
+# Local-conservation bundle knobs ported from the White-River v7-R1 recipe.
+# All default to "off" so use_local_physics_loss=true alone reproduces the
+# v3 1D-coupling formulation bit-identically; the bundle scripts override.
+local_loss_warmup_epochs: 0          # >0 => linear ramp 0 -> local_physics_loss_weight
+local_loss_smooth_l1_beta: 0.0       # >0 => smooth_l1(beta=...) replaces plain L1
+compute_boundary_mask: false         # convex hull mask on 2D xy_coords
+mask_inlets_in_lc: false             # OR the 2D-side inlet nodes into the boundary mask
+restrict_lc_to_2d: false             # H2: drop 1D nodes from the LMC residual
+
+# v9: time-less peak-depth prediction ("neural flood emulator"). When true,
+# each event is a single graph (one forward pass, no rollout/time window).
+# Node input = static features + a per-event total-rainfall scalar; target =
+# per-node peak depth above ground; num_output_features must be 1 and
+# num_input_features set to the static width + 1 (10 for 2D-only, 14 for
+# use_1d). LMC, if on, uses the steady-state continuity variant. Defaults
+# to false so all autoregressive runs reproduce byte-for-byte.
+static_prediction: false
+
 # 1D drainage system + 1D-2D coupling (Phase 2).
 # When true, num_input_features must be set to 20 (12 base + 4 extras +
 # 2*n_time_steps dynamic) and num_edge_features to 10 (3 shared + 4 1D-specific
 # + 3-col edge_type one-hot). Override at runtime via the v1 train script —
 # the defaults below stay 2D-only so existing v5 runs reproduce byte-for-byte.
 use_1d: false
+
+# When true, the unified 2D+1D graph appends GT edge_q_prev (normalised
+# per-edge previous flow) as the 11th column of edge_attr, giving the
+# model an explicit dynamic edge feature. Requires num_edge_features=11.
+# Exp 2 of urbanflood_lc_bundle_v3 only — Exp 1 keeps the default false.
+edge_q_prev_as_input: false
+
+# DUALFloodGNN-style architectural antisymmetry for the LMC residual.
+# When true, the LMC uses forward edges only with scatter +Q to dst and
+# -Q to src (no empirical /2.0). Forward-edge indices come from the
+# graph attribute `is_forward_edge` set by the dataset when this flag
+# is on. Removes the antisymmetry-violation noise floor in the LMC
+# gradient (see urbanflood_lc_bundle_v3.md §7.4). Exp 3 and Exp 4.
+lmc_antisymmetric: false
+
+# DUALFloodGNN-style edge decoder that concatenates the endpoint node
+# embeddings (h_u, h_v) with the processed edge embedding e_uv before
+# the final MLP. Couples edge predictions to node states, which is the
+# consistency LMC is trying to enforce. Exp 4 only.
+edge_decoder_concat_endpoints: false
+
+# LMC bundle v7: per-node-type weighted mean of the LMC residual. The
+# unweighted mean (default) drowns the ~50 1D nodes in ~3733 2D nodes,
+# starving the 2D-1D connection-seam constraint of gradient signal.
+# Options:
+#   "none"     → residual_norm.abs().mean() (legacy; v3 Exp 1 behaviour).
+#   "per_type" → 2D nodes weight 1, 1D nodes weight N_2d_kept/N_1d_kept,
+#                so each type contributes equal total weight to the mean.
+# Has no effect when restrict_lc_to_2d=true (1D nodes already dropped)
+# or when graph.node_type is absent (2D-only runs).
+lmc_node_type_weighting: "none"
+
+# LMC bundle v5: multi-step autoregressive rollout training (DUALFloodGNN
+# regime, paper Eq. 25 + §4.3). List of [epoch_start, O] pairs. The trainer
+# uses the largest O whose epoch_start <= current_epoch, and the dataset
+# pre-computes that many GT future steps per sample. The default
+# [[0, 1]] preserves the legacy single-step + pushforward behavior. Used
+# by v5 scripts to schedule e.g. [[0,1],[12,2],[25,4],[37,8]].
+rollout_curriculum: [[0, 1]]
 
 # Performance and optimization configurations.
 use_apex: True
@@ -79,3 +136,8 @@ num_test_samples: 29        # All 29 test events for Model_1.
 num_test_time_steps: 44     # min(test event timesteps) - n_time_steps = 46 - 2.
 test_dir: /home/woody/iwi5/iwi5416h/urbanflood/data
 animation_output_dir: animations
+
+# v6 checkpoint sweep (sweep_checkpoints.py only). Comma-separated string of
+# epoch indices to evaluate, plus CSV output path. Unused by train.py / inference.py.
+sweep_epochs: "4,9,14,19,24,29,34,39,44,49"
+sweep_csv: sweep_results.csv

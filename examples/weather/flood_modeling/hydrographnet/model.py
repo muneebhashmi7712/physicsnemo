@@ -55,6 +55,7 @@ class HydroGraphKANWithEdgeDecoder(MeshGraphKAN):
         checkpoint_offloading: bool = False,
         recompute_activation: bool = False,
         num_harmonics: int = 5,
+        concat_endpoints: bool = False,
     ):
         super().__init__(
             input_dim_nodes=input_dim_nodes,
@@ -81,8 +82,16 @@ class HydroGraphKANWithEdgeDecoder(MeshGraphKAN):
 
         activation_fn = get_activation(mlp_activation_fn)
 
+        # DUALFloodGNN-style edge head: when concat_endpoints=True the head
+        # takes [h_u, h_v, e_uv] (3 * hidden_dim_processor) instead of just
+        # e_uv (hidden_dim_processor). Couples edge predictions to the node
+        # states whose volumes the LMC residual references.
+        self.concat_endpoints = concat_endpoints
+        edge_decoder_input_dim = (
+            3 * hidden_dim_processor if concat_endpoints else hidden_dim_processor
+        )
         self.edge_decoder = MeshGraphMLP(
-            hidden_dim_processor,
+            edge_decoder_input_dim,
             output_dim=1,
             hidden_dim=hidden_dim_node_decoder,
             hidden_layers=num_layers_node_decoder,
@@ -119,5 +128,13 @@ class HydroGraphKANWithEdgeDecoder(MeshGraphKAN):
 
         # Decode both node and edge predictions
         node_pred = self.node_decoder(node_features)
-        edge_pred = self.edge_decoder(edge_features)
+        if self.concat_endpoints:
+            g_ref = graph[0] if isinstance(graph, list) else graph
+            src, dst = g_ref.edge_index[0], g_ref.edge_index[1]
+            edge_decoder_in = torch.cat(
+                [node_features[src], node_features[dst], edge_features], dim=-1
+            )
+            edge_pred = self.edge_decoder(edge_decoder_in)
+        else:
+            edge_pred = self.edge_decoder(edge_features)
         return node_pred, edge_pred
