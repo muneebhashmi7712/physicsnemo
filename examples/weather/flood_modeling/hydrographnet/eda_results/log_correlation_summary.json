@@ -1,0 +1,20 @@
+{
+  "HydroGraphNet": {
+    "path": "/home/woody/iwi5/iwi5416h/hydrographnet/outputs_lc_v7_run1_rep1/train.log",
+    "rows": 20,
+    "corr": {
+      "n": 15,
+      "pearson_r": 0.9994861809102299,
+      "warmup_skipped": 5
+    }
+  },
+  "UrbanFlood (Model_1, v3 Exp 1)": {
+    "path": "/home/woody/iwi5/iwi5416h/urbanflood/outputs_lc_gt_conn_1d/train.log",
+    "rows": 50,
+    "corr": {
+      "n": 45,
+      "pearson_r": -0.19926629931561946,
+      "warmup_skipped": 5
+    }
+  }
+}
