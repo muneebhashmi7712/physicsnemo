@@ -136,6 +136,14 @@ num_test_samples: 29        # All 29 test events for Model_1.
 num_test_time_steps: 44     # min(test event timesteps) - n_time_steps = 46 - 2.
 test_dir: /home/woody/iwi5/iwi5416h/urbanflood/data
 animation_output_dir: animations
+# Set false for long rollouts — GIF rendering is one 3000x3000 px frame per
+# step and dominates runtime past ~8 steps. Declared here for Hydra struct mode.
+save_animations: true
+# Full-event rollout (test only): roll each event to its OWN length instead of a
+# single global num_test_time_steps, so every event's real flood window is scored
+# (the fixed 8-step window froze out the higher rainfall bins). Declared here for
+# Hydra struct mode. inference.py stores per-step metric series for prefix reuse.
+full_event_rollout: false
 
 # v6 checkpoint sweep (sweep_checkpoints.py only). Comma-separated string of
 # epoch indices to evaluate, plus CSV output path. Unused by train.py / inference.py.

@@ -81,6 +81,7 @@ class UrbanFloodDataset(Dataset):
         lmc_antisymmetric: bool = False,
         train_rollout_length: int = 1,
         static_prediction: bool = False,
+        full_event_rollout: bool = False,
     ):
         if split not in {"train", "test"}:
             raise ValueError(f"Invalid split '{split}'. Expected 'train' or 'test'.")
@@ -102,6 +103,11 @@ class UrbanFloodDataset(Dataset):
         self.edge_q_prev_as_input = edge_q_prev_as_input
         self.lmc_antisymmetric = lmc_antisymmetric
         self.train_rollout_length = max(1, int(train_rollout_length))
+        # Test-only: roll each event out to its OWN full length instead of a
+        # single global `rollout_length`. A fixed global length clamps to the
+        # shortest event and truncates long storms; per-event length is the only
+        # way to score each event's real flood window (see plan: full-event redo).
+        self.full_event_rollout = bool(full_event_rollout)
         # v9: time-less peak-depth prediction. When True, each event becomes a
         # single graph (one forward pass, no rollout/window); node input gets a
         # per-event total-rainfall scalar instead of the per-step precip/window,
@@ -654,7 +660,15 @@ class UrbanFloodDataset(Dataset):
         elif self.split == "test":
             for dyn in self.dynamic_data:
                 T = dyn["water_depth"].shape[0]
-                if T < self.n_time_steps + self.rollout_length:
+                if self.full_event_rollout:
+                    # Per-event full rollout: only need at least one future step
+                    # beyond the warmup window.
+                    if T <= self.n_time_steps:
+                        raise ValueError(
+                            f"Event {dyn['event_id']} has {T} timesteps, needs at "
+                            f"least {self.n_time_steps + 1} for full-event rollout."
+                        )
+                elif T < self.n_time_steps + self.rollout_length:
                     raise ValueError(
                         f"Event {dyn['event_id']} has {T} timesteps, needs at least "
                         f"{self.n_time_steps + self.rollout_length}."
@@ -1302,29 +1316,25 @@ class UrbanFloodDataset(Dataset):
                 )
             if "boundary_mask" in sd:
                 g.boundary_mask = torch.tensor(sd["boundary_mask"], dtype=torch.bool)
+            # End of the rollout window. Full-event mode rolls to the event end
+            # (each event to its own length); otherwise the fixed global window.
+            _end = (None if self.full_event_rollout
+                    else self.n_time_steps + self.rollout_length)
             rollout_data = {
                 "inflow": torch.tensor(
-                    dyn["inflow_hydrograph"][
-                        self.n_time_steps : self.n_time_steps + self.rollout_length
-                    ],
+                    dyn["inflow_hydrograph"][self.n_time_steps : _end],
                     dtype=torch.float,
                 ),
                 "precipitation": torch.tensor(
-                    dyn["precipitation"][
-                        self.n_time_steps : self.n_time_steps + self.rollout_length
-                    ],
+                    dyn["precipitation"][self.n_time_steps : _end],
                     dtype=torch.float,
                 ),
                 "water_depth_gt": torch.tensor(
-                    dyn["water_depth"][
-                        self.n_time_steps : self.n_time_steps + self.rollout_length
-                    ],
+                    dyn["water_depth"][self.n_time_steps : _end],
                     dtype=torch.float,
                 ),
                 "volume_gt": torch.tensor(
-                    dyn["volume"][
-                        self.n_time_steps : self.n_time_steps + self.rollout_length
-                    ],
+                    dyn["volume"][self.n_time_steps : _end],
                     dtype=torch.float,
                 ),
             }

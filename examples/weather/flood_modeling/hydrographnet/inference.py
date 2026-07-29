@@ -27,6 +27,8 @@ For each test event, generates a four-panel animation:
 """
 
 import os
+import json
+import math
 import numpy as np
 import torch
 import hydra
@@ -37,6 +39,7 @@ from omegaconf import DictConfig, OmegaConf
 from hydra.utils import to_absolute_path
 
 from physicsnemo.utils import load_checkpoint
+from metrics import compute_nse, compute_csi
 
 from physicsnemo.datapipes.gnn.hydrographnet_dataset import UrbanFloodDataset
 from physicsnemo.models.meshgraphnet.meshgraphkan import MeshGraphKAN
@@ -194,6 +197,14 @@ def main(cfg: DictConfig):
     ckpt_path = cfg.get("ckpt_path")
     anim_output_dir = cfg.get("animation_output_dir", "animations")
     os.makedirs(anim_output_dir, exist_ok=True)
+    # Long-rollout runs render one GIF frame per step at 3000x3000 px, which
+    # dominates runtime once rollout_length leaves the 8-step regime. Default
+    # stays True so existing invocations are unchanged.
+    save_animations = bool(cfg.get("save_animations", True))
+    # Full-event rollout: roll each test event to its OWN length (not a single
+    # global num_test_time_steps). Needed so every event's real flood window is
+    # scored — the fixed 8-step window froze out the higher rainfall bins.
+    full_event = bool(cfg.get("full_event_rollout", False))
 
     print("Configuration:\n", OmegaConf.to_yaml(cfg))
 
@@ -212,6 +223,7 @@ def main(cfg: DictConfig):
         edge_q_prev_as_input=bool(cfg.get("edge_q_prev_as_input", False)),
         lmc_antisymmetric=bool(cfg.get("lmc_antisymmetric", False)),
         static_prediction=static_prediction,
+        full_event_rollout=full_event,
     )
     print(f"Loaded test dataset with {len(test_dataset)} events.")
 
@@ -271,6 +283,10 @@ def main(cfg: DictConfig):
     )
     print(f"Checkpoint loaded from epoch {epoch_loaded}")
     model.eval()
+    # The autoregressive rollout below is not wrapped in no_grad, so the graph
+    # was accumulating across every step — harmless at 8 steps, OOM past ~40 on
+    # a 10 GB card. Nothing in this script backprops, so disable grad globally.
+    torch.set_grad_enabled(False)
 
     # ------------------------------------------------------------------
     # v9: time-less peak-depth prediction — one forward pass per event.
@@ -348,6 +364,13 @@ def main(cfg: DictConfig):
     all_rmse_2d = []   # per-event RMSE on 2D nodes only (use_1d case)
     all_rmse_1d = []   # per-event RMSE on 1D nodes only (use_1d case)
 
+    # Phase A (scale-free re-analysis): per-event 2D-only NSE / CSI / scale-free
+    # error, mirroring the HydrographNet combo-holdout metrics.json so the two
+    # datasets are compared with identical definitions. 2D is the governing
+    # field for UrbanFlood (1D is an input, not a target).
+    tau_wet = float(cfg.get("scalefree_tau", 0.01))  # min GT std (m) for NSE conditioning
+    per_hydrograph = {}
+
     # Loop over each test event.
     for idx in range(len(test_dataset)):
         g, rollout_data = test_dataset[idx]
@@ -364,10 +387,20 @@ def main(cfg: DictConfig):
         rmse_list = []
         rmse_2d_list = []
         rmse_1d_list = []
+        # Phase A: per-step 2D-only scale-free diagnostics (conditioned on wet GT).
+        nse_2d_list = []           # per-step NSE on conditioned steps only
+        csi005_2d_list = []
+        csi030_2d_list = []
+        rmse_over_sigma_list = []  # companion global RSR = RMSE_2d / max(std_gt, tau)
+        nse_2d_series = []         # step-aligned NSE (NaN on unconditioned steps)
+        sd_gt_2d_list = []         # per-step GT spatial std (m)
 
         inflow_seq = rollout_data["inflow"].to(device)
         precip_seq = rollout_data["precipitation"].to(device)
         wd_gt_seq = rollout_data["water_depth_gt"].to(device)
+        # Per-event rollout length = returned GT sequence length. In full-event
+        # mode this is the event's own length; otherwise the fixed global window.
+        n_steps_ev = wd_gt_seq.shape[0]
 
         # Denormalize "elevation" column (column 3) for surface depth computation.
         # In use_1d schema, this column is ground_elev for 2D rows and
@@ -400,7 +433,7 @@ def main(cfg: DictConfig):
 
         X_iter = X_current.clone()
 
-        for t in range(rollout_length):
+        for t in range(n_steps_ev):
             static_part = X_iter[:, :n_static]
             water_depth_window = X_iter[:, n_static : n_static + n_time_steps]
             volume_window = X_iter[:, n_static + n_time_steps : n_static + 2 * n_time_steps]
@@ -462,11 +495,25 @@ def main(cfg: DictConfig):
                 m2 = node_type == 0
                 m1 = node_type == 1
                 if m2.any():
-                    rmse_2d_list.append(
-                        torch.sqrt(
-                            torch.mean((pred_depth[m2] - gt_depth[m2]) ** 2)
-                        ).item()
-                    )
+                    p2, g2 = pred_depth[m2], gt_depth[m2]
+                    rmse_2d = torch.sqrt(torch.mean((p2 - g2) ** 2)).item()
+                    rmse_2d_list.append(rmse_2d)
+                    # Scale-free diagnostics on the 2D field. Population std of GT
+                    # gates NSE: when the observed field is near-flat (dry / early
+                    # steps) NSE is ill-posed (sqrt(1-NSE) blows up), so only count
+                    # steps whose GT std >= tau; always carry the robust companion.
+                    sd_gt = torch.std(g2, unbiased=False).item()
+                    sd_gt_2d_list.append(sd_gt)
+                    csi005_2d_list.append(compute_csi(p2, g2, 0.05))
+                    csi030_2d_list.append(compute_csi(p2, g2, 0.30))
+                    rmse_over_sigma_list.append(rmse_2d / max(sd_gt, tau_wet))
+                    if sd_gt >= tau_wet:
+                        _nse_step = compute_nse(p2, g2)
+                        nse_2d_list.append(_nse_step)
+                        nse_2d_series.append(_nse_step)
+                    else:
+                        # keep the series step-aligned; unconditioned = NaN
+                        nse_2d_series.append(float("nan"))
                 if m1.any():
                     rmse_1d_list.append(
                         torch.sqrt(
@@ -490,40 +537,140 @@ def main(cfg: DictConfig):
         else:
             print(f"Event {sample_id}: Mean RMSE = {mean_rmse_sample:.4f} m")
 
-        anim_filename = os.path.join(anim_output_dir, f"animation_{sample_id}.gif")
-        create_animation(rollout_preds, ground_truth_list, g, rmse_list, anim_filename)
+        # Phase A: record per-event 2D-only scale-free metrics for metrics.json.
+        def _nanmean(xs):
+            vals = [v for v in xs if not math.isnan(v)]
+            return sum(vals) / len(vals) if vals else float("nan")
 
-    all_rmse_tensor = torch.tensor(all_rmse_all)
-    overall_mean_rmse = torch.mean(all_rmse_tensor, dim=0)
-    overall_std_rmse = torch.std(all_rmse_tensor, dim=0)
-    print("Overall Mean RMSE (m) over rollout steps:", overall_mean_rmse)
-    print("Overall Std RMSE (m) over rollout steps:", overall_std_rmse)
+        mean_rmse_2d = (
+            sum(rmse_2d_list) / len(rmse_2d_list) if rmse_2d_list else float("nan")
+        )
+        if nse_2d_list:
+            mean_nse_2d = sum(nse_2d_list) / len(nse_2d_list)
+            scalefree_err = math.sqrt(max(0.0, 1.0 - mean_nse_2d))
+            scalefree_defined = True
+        else:
+            mean_nse_2d = float("nan")
+            scalefree_err = float("nan")
+            scalefree_defined = False
+        mean_ros = (
+            sum(rmse_over_sigma_list) / len(rmse_over_sigma_list)
+            if rmse_over_sigma_list else float("nan")
+        )
+        per_hydrograph[str(sample_id)] = {
+            "mean_rmse": mean_rmse_2d,            # 2D-only, meters (governing field)
+            "mean_rmse_allnodes": mean_rmse_sample,
+            "mean_nse": mean_nse_2d,
+            "mean_csi_005": _nanmean(csi005_2d_list),
+            "mean_csi_030": _nanmean(csi030_2d_list),
+            "scalefree_err": scalefree_err,
+            "scalefree_err_pct": (100.0 * scalefree_err
+                                  if scalefree_defined else float("nan")),
+            "rmse_over_sigma": mean_ros,
+            "n_timesteps": len(rmse_2d_list),
+            "n_conditioned": len(nse_2d_list),
+            "scalefree_defined": scalefree_defined,
+            # Per-step 2D series so ANY shorter horizon can be recovered as a
+            # prefix of a long rollout without re-running inference. All are
+            # step-aligned (same length = n_timesteps); nse is NaN on
+            # unconditioned (near-dry) steps.
+            "rmse_2d_series": list(rmse_2d_list),
+            "nse_2d_series": list(nse_2d_series),
+            "csi005_2d_series": list(csi005_2d_list),
+            "csi030_2d_series": list(csi030_2d_list),
+            "rmse_over_sigma_series": list(rmse_over_sigma_list),
+            "sd_gt_series": list(sd_gt_2d_list),
+        }
 
-    if all_rmse_2d and all_rmse_1d:
-        m2 = torch.tensor(all_rmse_2d)
-        m1 = torch.tensor(all_rmse_1d)
-        print("Overall Mean RMSE — 2D nodes:", torch.mean(m2, dim=0))
-        print("Overall Std  RMSE — 2D nodes:", torch.std(m2, dim=0))
-        print("Overall Mean RMSE — 1D nodes:", torch.mean(m1, dim=0))
-        print("Overall Std  RMSE — 1D nodes:", torch.std(m1, dim=0))
+        if save_animations:
+            anim_filename = os.path.join(anim_output_dir, f"animation_{sample_id}.gif")
+            create_animation(rollout_preds, ground_truth_list, g, rmse_list, anim_filename)
 
-    # 5 minutes per step for UrbanFlood.
-    timesteps = [(i + 1) * (5 / 60) for i in range(rollout_length)]
-    plt.figure(figsize=(10, 6))
-    plt.plot(timesteps, overall_mean_rmse.numpy(), label="Mean RMSE", linewidth=3)
-    plt.fill_between(
-        timesteps,
-        (overall_mean_rmse - overall_std_rmse).numpy(),
-        (overall_mean_rmse + overall_std_rmse).numpy(),
-        alpha=0.3,
-        label="± Std",
+    # Full-event mode gives each event its own length, so stacking the per-step
+    # RMSE lists (torch.tensor over ragged rows) is undefined — guard it. The
+    # per-event metrics.json below is the authoritative output either way.
+    _lengths = {len(r) for r in all_rmse_all}
+    _stackable = bool(all_rmse_all) and len(_lengths) == 1
+    overall_mean_rmse = overall_std_rmse = None
+    if _stackable:
+        all_rmse_tensor = torch.tensor(all_rmse_all)
+        overall_mean_rmse = torch.mean(all_rmse_tensor, dim=0)
+        overall_std_rmse = torch.std(all_rmse_tensor, dim=0)
+        print("Overall Mean RMSE (m) over rollout steps:", overall_mean_rmse)
+        print("Overall Std RMSE (m) over rollout steps:", overall_std_rmse)
+        if all_rmse_2d and all_rmse_1d and len({len(r) for r in all_rmse_2d}) == 1:
+            m2 = torch.tensor(all_rmse_2d)
+            m1 = torch.tensor(all_rmse_1d)
+            print("Overall Mean RMSE — 2D nodes:", torch.mean(m2, dim=0))
+            print("Overall Std  RMSE — 2D nodes:", torch.std(m2, dim=0))
+            print("Overall Mean RMSE — 1D nodes:", torch.mean(m1, dim=0))
+            print("Overall Std  RMSE — 1D nodes:", torch.std(m1, dim=0))
+    else:
+        print(f"Variable-length rollout (lengths {sorted(_lengths)}) — skipping "
+              f"stacked overall-RMSE curve; per-event metrics.json is authoritative.")
+
+    # Phase A: write per-event scale-free metrics.json next to the GIFs, mirroring
+    # the HydrographNet combo-holdout metrics.json (per_hydrograph + overall block).
+    def _mean_defined(key):
+        vals = [
+            v[key] for v in per_hydrograph.values()
+            if isinstance(v[key], float) and not math.isnan(v[key])
+        ]
+        return sum(vals) / len(vals) if vals else float("nan")
+
+    metrics_output = {
+        "config": {
+            "ckpt_path": str(ckpt_path),
+            "epoch_loaded": int(epoch_loaded) if epoch_loaded is not None else None,
+            "rollout_length": int(rollout_length),
+            "full_event_rollout": full_event,
+            "model_name": model_name,
+            "use_1d": bool(use_1d),
+            "use_local_physics_loss": bool(use_local_physics_loss),
+            "scalefree_tau": tau_wet,
+            "n_events": len(per_hydrograph),
+        },
+        "overall": {
+            "rmse_2d_mean": _mean_defined("mean_rmse"),
+            "nse_2d_mean": _mean_defined("mean_nse"),
+            "csi_005_mean": _mean_defined("mean_csi_005"),
+            "csi_030_mean": _mean_defined("mean_csi_030"),
+            "scalefree_err_pct_mean": _mean_defined("scalefree_err_pct"),
+            "rmse_over_sigma_mean": _mean_defined("rmse_over_sigma"),
+            "n_scalefree_undefined": sum(
+                1 for v in per_hydrograph.values() if not v["scalefree_defined"]
+            ),
+        },
+        "per_hydrograph": per_hydrograph,
+    }
+    metrics_path = os.path.join(anim_output_dir, "metrics.json")
+    with open(metrics_path, "w") as fh:
+        json.dump(metrics_output, fh, indent=2)
+    print(
+        f"Wrote per-event scale-free metrics to {metrics_path} "
+        f"({len(per_hydrograph)} events, "
+        f"{metrics_output['overall']['n_scalefree_undefined']} scale-free undefined)"
     )
-    plt.xlabel("Time (Hours)", fontsize=20)
-    plt.ylabel("RMSE (m)", fontsize=20)
-    plt.title("Overall RMSE Curve Over Rollout", fontsize=24)
-    plt.legend(fontsize=16)
-    plt.grid(True)
-    plt.show()
+
+    # 5 minutes per step for UrbanFlood. Only meaningful when every event shares
+    # one rollout length (guarded); skipped for variable-length full-event runs.
+    if _stackable and overall_mean_rmse is not None:
+        timesteps = [(i + 1) * (5 / 60) for i in range(len(overall_mean_rmse))]
+        plt.figure(figsize=(10, 6))
+        plt.plot(timesteps, overall_mean_rmse.numpy(), label="Mean RMSE", linewidth=3)
+        plt.fill_between(
+            timesteps,
+            (overall_mean_rmse - overall_std_rmse).numpy(),
+            (overall_mean_rmse + overall_std_rmse).numpy(),
+            alpha=0.3,
+            label="± Std",
+        )
+        plt.xlabel("Time (Hours)", fontsize=20)
+        plt.ylabel("RMSE (m)", fontsize=20)
+        plt.title("Overall RMSE Curve Over Rollout", fontsize=24)
+        plt.legend(fontsize=16)
+        plt.grid(True)
+        plt.show()
 
 
 if __name__ == "__main__":
