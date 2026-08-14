@@ -7,6 +7,11 @@ Evaluation metrics for HydroGraphNet inference, matching the paper
 
 All functions expect denormalized tensors in physical units (meters for
 water depth, m^3 for volume).
+
+The mass-balance metric is the paper's squared global continuity residual
+(Equation 33), not a prediction-versus-ground-truth volume error. Its unit is
+the square of the volume unit (m^6 here); it is not a depth or a relative
+error.
 """
 
 import torch
@@ -16,18 +21,7 @@ def compute_rmse(pred: torch.Tensor, gt: torch.Tensor) -> float:
     """Root Mean Square Error (Eq. 31).
 
     RMSE = sqrt(1/N * sum((h_pred_i - h_obs_i)^2))
-
-    Parameters
-    ----------
-    pred : torch.Tensor
-        Predicted water depth [num_nodes].
-    gt : torch.Tensor
-        Ground truth water depth [num_nodes].
-
-    Returns
-    -------
-    float
-        RMSE in meters. Lower is better.
+    Returns RMSE in meters. Lower is better.
     """
     return torch.sqrt(torch.mean((pred - gt) ** 2)).item()
 
@@ -36,18 +30,7 @@ def compute_nse(pred: torch.Tensor, gt: torch.Tensor) -> float:
     """Nash-Sutcliffe Efficiency coefficient (Eq. 32).
 
     NSE = 1 - sum((h_pred - h_obs)^2) / sum((h_obs - h_mean)^2)
-
-    Parameters
-    ----------
-    pred : torch.Tensor
-        Predicted water depth [num_nodes].
-    gt : torch.Tensor
-        Ground truth water depth [num_nodes].
-
-    Returns
-    -------
-    float
-        NSE value. 1.0 = perfect, 0.0 = as good as mean, <0 = worse than mean.
+    1.0 = perfect, 0.0 = as good as mean, <0 = worse than mean.
     """
     ss_res = torch.sum((pred - gt) ** 2)
     ss_tot = torch.sum((gt - torch.mean(gt)) ** 2)
@@ -60,20 +43,7 @@ def compute_csi(pred: torch.Tensor, gt: torch.Tensor, threshold: float) -> float
     """Critical Success Index at a given water depth threshold (Section 5.1).
 
     CSI = hits / (hits + misses + false_alarms)
-
-    Parameters
-    ----------
-    pred : torch.Tensor
-        Predicted water depth [num_nodes] in meters.
-    gt : torch.Tensor
-        Ground truth water depth [num_nodes] in meters.
-    threshold : float
-        Water depth threshold in meters (paper uses 0.05 and 0.3).
-
-    Returns
-    -------
-    float
-        CSI value in [0, 1]. Higher is better. NaN if no events at threshold.
+    Higher is better. NaN if no exceedances in either pred or gt.
     """
     pred_exceed = pred >= threshold
     gt_exceed = gt >= threshold
@@ -86,25 +56,82 @@ def compute_csi(pred: torch.Tensor, gt: torch.Tensor, threshold: float) -> float
     return hits / denom
 
 
-def compute_mass_balance_error(pred_vol: torch.Tensor, gt_vol: torch.Tensor) -> float:
-    """Relative mass balance error.
+def compute_mass_balance_residual(
+    current_volume: torch.Tensor,
+    previous_volume: torch.Tensor,
+    net_source_rate_previous: torch.Tensor | float,
+    net_source_rate_current: torch.Tensor | float,
+    delta_t: float,
+) -> float:
+    r"""Return the signed global continuity residual from paper Equation 33.
 
-    MBE = |sum(V_pred) - sum(V_gt)| / sum(V_gt)
+    .. math::
 
-    Parameters
-    ----------
-    pred_vol : torch.Tensor
-        Predicted volume per node [num_nodes] in m^3.
-    gt_vol : torch.Tensor
-        Ground truth volume per node [num_nodes] in m^3.
+        r(t) = \sum_i V_i^{(t)} - \sum_i V_i^{(t-1)}
+             - \frac{\Delta t}{2}\left(s^{(t-1)} + s^{(t)}\right)
 
-    Returns
-    -------
-    float
-        Relative mass balance error. 0.0 = perfect conservation.
+    net_source_rate_* is the already-combined external source rate s:
+    boundary inflow plus effective rainfall minus infiltration and any known
+    external outflow. Internal edge flows must not be included because they
+    cancel in a whole-domain balance.
+
+    Inputs must be denormalized and mutually consistent. If volume is in m^3,
+    source rate must be in m^3/s and delta_t in seconds; the returned residual
+    is then in m^3. Summation is deliberately performed in float64 because
+    subtracting two large domain totals in float32 can manufacture a substantial
+    apparent balance error.
     """
-    total_pred = pred_vol.sum().item()
-    total_gt = gt_vol.sum().item()
-    if abs(total_gt) < 1e-12:
-        return 0.0 if abs(total_pred) < 1e-12 else float("inf")
-    return abs(total_pred - total_gt) / abs(total_gt)
+    if not isinstance(delta_t, (int, float)) or not torch.isfinite(
+        torch.tensor(float(delta_t), dtype=torch.float64)
+    ):
+        raise ValueError("delta_t must be a finite positive number")
+    if delta_t <= 0:
+        raise ValueError("delta_t must be a finite positive number")
+
+    current = torch.as_tensor(current_volume)
+    previous = torch.as_tensor(previous_volume, device=current.device)
+    source_previous = torch.as_tensor(
+        net_source_rate_previous, device=current.device, dtype=torch.float64
+    )
+    source_current = torch.as_tensor(
+        net_source_rate_current, device=current.device, dtype=torch.float64
+    )
+
+    values = (current, previous, source_previous, source_current)
+    if any(value.numel() == 0 for value in values):
+        raise ValueError("mass-balance inputs must be non-empty")
+    if any(not torch.isfinite(value).all().item() for value in values):
+        raise ValueError("mass-balance inputs must contain only finite values")
+
+    storage_change = current.to(torch.float64).sum() - previous.to(torch.float64).sum()
+    integrated_source = 0.5 * float(delta_t) * (
+        source_previous.sum() + source_current.sum()
+    )
+    return (storage_change - integrated_source).item()
+
+
+def compute_mass_balance_error(
+    current_volume: torch.Tensor,
+    previous_volume: torch.Tensor,
+    net_source_rate_previous: torch.Tensor | float,
+    net_source_rate_current: torch.Tensor | float,
+    delta_t: float,
+) -> float:
+    r"""Mass-balance error from HydroGraphNet paper Equation 33.
+
+    The metric is compute_mass_balance_residual(...) ** 2. Perfect global
+    conservation gives zero. If volume is expressed in m^3 the result is in
+    m^6.
+
+    This intentionally does not compare predicted and ground-truth volumes.
+    That relative volume-accuracy calculation was the project's previous,
+    broken implementation and is not the metric defined by the paper.
+    """
+    residual = compute_mass_balance_residual(
+        current_volume,
+        previous_volume,
+        net_source_rate_previous,
+        net_source_rate_current,
+        delta_t,
+    )
+    return residual * residual

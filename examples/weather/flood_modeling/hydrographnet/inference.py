@@ -50,7 +50,13 @@ from physicsnemo.utils import load_checkpoint
 from physicsnemo.datapipes.gnn.hydrographnet_dataset import HydroGraphDataset
 from physicsnemo.models.meshgraphnet.meshgraphkan import MeshGraphKAN
 from model import HydroGraphKANWithEdgeDecoder
-from metrics import compute_rmse, compute_nse, compute_csi, compute_mass_balance_error
+from metrics import (
+    compute_csi,
+    compute_mass_balance_error,
+    compute_mass_balance_residual,
+    compute_nse,
+    compute_rmse,
+)
 
 # For converting PyG graph to networkx.
 from torch_geometric.utils import to_networkx
@@ -230,6 +236,30 @@ def main(cfg: DictConfig):
     vol_mean = test_dataset.dynamic_stats["volume"]["mean"]
     vol_std = test_dataset.dynamic_stats["volume"]["std"]
     eps = 1e-8
+    inflow_stats = test_dataset.dynamic_stats["inflow_hydrograph"]
+    inflow_mean = inflow_stats["mean"]
+    inflow_std = inflow_stats["std"]
+    precip_stats = test_dataset.dynamic_stats["precipitation"]
+    precip_mean = precip_stats["mean"]
+    precip_std = precip_stats["std"]
+    delta_t = float(cfg.get("delta_t", 1200.0))
+    area_m2 = torch.as_tensor(
+        test_dataset.static_data["area_denorm"], dtype=torch.float64
+    ).reshape(-1)
+    impervious_fraction = torch.as_tensor(
+        test_dataset.denormalize(
+            test_dataset.static_data["infiltration"],
+            test_dataset.static_stats["infiltration"]["mean"],
+            test_dataset.static_stats["infiltration"]["std"],
+        ),
+        dtype=torch.float64,
+    ).reshape(-1) / 100.0
+    domain_area_m2 = float(area_m2.sum().item())
+    effective_rain_area_m2 = float(
+        (area_m2 * impervious_fraction).sum().item()
+    )
+    if domain_area_m2 <= 0.0:
+        raise ValueError("HydroGraphNet domain area must be positive")
 
     # Instantiate the model.
     num_input_features = cfg.get("num_input_features", 16)
@@ -299,6 +329,7 @@ def main(cfg: DictConfig):
             )
             print(f"Checkpoint loaded from epoch {epoch_loaded}")
     model.eval()
+    torch.set_grad_enabled(False)
 
     # Metric collection across all hydrographs.
     all_rmse_all = []
@@ -306,6 +337,11 @@ def main(cfg: DictConfig):
     all_csi_005_all = []
     all_csi_030_all = []
     all_mbe_all = []
+    all_mbe_gt_all = []
+    all_mass_residual_all = []
+    all_mass_residual_gt_all = []
+    all_abs_balance_depth_all = []
+    all_abs_balance_depth_gt_all = []
     sample_ids = []
 
     # Loop over each test hydrograph.
@@ -323,12 +359,28 @@ def main(cfg: DictConfig):
         csi_005_list = []
         csi_030_list = []
         mbe_list = []
+        mbe_gt_list = []
+        mass_residual_list = []
+        mass_residual_gt_list = []
+        abs_balance_depth_list = []
+        abs_balance_depth_gt_list = []
 
         # Rollout data tensors.
         inflow_seq = rollout_data["inflow"].to(device)
         precip_seq = rollout_data["precipitation"].to(device)
         wd_gt_seq = rollout_data["water_depth_gt"].to(device)
         vol_gt_seq = rollout_data["volume_gt"].to(device)
+        dyn_event = test_dataset.dynamic_data[idx]
+        previous_inflow_norm = torch.as_tensor(
+            dyn_event["inflow_hydrograph"][n_time_steps - 1],
+            device=device,
+            dtype=torch.float64,
+        )
+        previous_precip_norm = torch.as_tensor(
+            dyn_event["precipitation"][n_time_steps - 1],
+            device=device,
+            dtype=torch.float64,
+        )
 
         X_iter = X_current.clone()
 
@@ -374,8 +426,33 @@ def main(cfg: DictConfig):
             # Denormalize to physical units for metrics.
             pred_wd_real = new_wd.squeeze(1) * (wd_std + eps) + wd_mean
             gt_wd_real = wd_gt_seq[t] * (wd_std + eps) + wd_mean
-            pred_vol_real = new_vol.squeeze(1) * (vol_std + eps) + vol_mean
-            gt_vol_real = vol_gt_seq[t] * (vol_std + eps) + vol_mean
+            pred_vol_real = (
+                new_vol.squeeze(1).to(torch.float64) * (vol_std + eps) + vol_mean
+            )
+            gt_vol_real = (
+                vol_gt_seq[t].to(torch.float64) * (vol_std + eps) + vol_mean
+            )
+            previous_pred_vol_real = (
+                volume_window[:, -1].to(torch.float64) * (vol_std + eps) + vol_mean
+            )
+            gt_previous_vol_norm = (
+                volume_window[:, -1] if t == 0 else vol_gt_seq[t - 1]
+            )
+            previous_gt_vol_real = (
+                gt_previous_vol_norm.to(torch.float64) * (vol_std + eps) + vol_mean
+            )
+            current_inflow_norm = inflow_seq[t].to(torch.float64)
+            current_precip_norm = precip_seq[t].to(torch.float64)
+            previous_inflow = previous_inflow_norm * (inflow_std + eps) + inflow_mean
+            current_inflow = current_inflow_norm * (inflow_std + eps) + inflow_mean
+            previous_precip = previous_precip_norm * (precip_std + eps) + precip_mean
+            current_precip = current_precip_norm * (precip_std + eps) + precip_mean
+            net_source_rate_previous = (
+                previous_inflow + previous_precip * effective_rain_area_m2
+            )
+            net_source_rate_current = (
+                current_inflow + current_precip * effective_rain_area_m2
+            )
 
             # Store denormalized values for animation.
             rollout_preds.append(pred_wd_real.detach().cpu())
@@ -386,7 +463,43 @@ def main(cfg: DictConfig):
             nse_list.append(compute_nse(pred_wd_real, gt_wd_real))
             csi_005_list.append(compute_csi(pred_wd_real, gt_wd_real, 0.05))
             csi_030_list.append(compute_csi(pred_wd_real, gt_wd_real, 0.30))
-            mbe_list.append(compute_mass_balance_error(pred_vol_real, gt_vol_real))
+            # HydroGraphNet paper Equation 33: squared global continuity residual.
+            mass_residual = compute_mass_balance_residual(
+                pred_vol_real,
+                previous_pred_vol_real,
+                net_source_rate_previous,
+                net_source_rate_current,
+                delta_t,
+            )
+            mbe = compute_mass_balance_error(
+                pred_vol_real,
+                previous_pred_vol_real,
+                net_source_rate_previous,
+                net_source_rate_current,
+                delta_t,
+            )
+            mass_residual_gt = compute_mass_balance_residual(
+                gt_vol_real,
+                previous_gt_vol_real,
+                net_source_rate_previous,
+                net_source_rate_current,
+                delta_t,
+            )
+            mbe_gt = compute_mass_balance_error(
+                gt_vol_real,
+                previous_gt_vol_real,
+                net_source_rate_previous,
+                net_source_rate_current,
+                delta_t,
+            )
+            mbe_list.append(mbe)
+            mbe_gt_list.append(mbe_gt)
+            mass_residual_list.append(mass_residual)
+            mass_residual_gt_list.append(mass_residual_gt)
+            abs_balance_depth_list.append(abs(mass_residual) / domain_area_m2 * 1000.0)
+            abs_balance_depth_gt_list.append(abs(mass_residual_gt) / domain_area_m2 * 1000.0)
+            previous_inflow_norm = current_inflow_norm
+            previous_precip_norm = current_precip_norm
 
         # Aggregate per-hydrograph.
         all_rmse_all.append(rmse_list)
@@ -394,6 +507,11 @@ def main(cfg: DictConfig):
         all_csi_005_all.append(csi_005_list)
         all_csi_030_all.append(csi_030_list)
         all_mbe_all.append(mbe_list)
+        all_mbe_gt_all.append(mbe_gt_list)
+        all_mass_residual_all.append(mass_residual_list)
+        all_mass_residual_gt_all.append(mass_residual_gt_list)
+        all_abs_balance_depth_all.append(abs_balance_depth_list)
+        all_abs_balance_depth_gt_all.append(abs_balance_depth_gt_list)
 
         sample_id = test_dataset.dynamic_data[idx].get("hydro_id", idx)
         sample_ids.append(str(sample_id))
@@ -405,12 +523,14 @@ def main(cfg: DictConfig):
         mean_csi_005 = sum(valid_csi_005) / len(valid_csi_005) if valid_csi_005 else float("nan")
         mean_csi_030 = sum(valid_csi_030) / len(valid_csi_030) if valid_csi_030 else float("nan")
         mean_mbe = sum(mbe_list) / len(mbe_list)
+        mean_mbe_gt = sum(mbe_gt_list) / len(mbe_gt_list)
 
         print(
             f"Hydrograph {sample_id}: "
             f"RMSE={mean_rmse:.4f}m | NSE={mean_nse:.4f} | "
             f"CSI@0.05={mean_csi_005:.4f} | CSI@0.3={mean_csi_030:.4f} | "
-            f"MBE={mean_mbe:.6f}"
+            f"MBE(Eq33)={mean_mbe:.6e} m^6 | "
+            f"GT floor={mean_mbe_gt:.6e} m^6"
         )
 
         # anim_filename = os.path.join(anim_output_dir, f"animation_{sample_id}.gif")
@@ -421,7 +541,12 @@ def main(cfg: DictConfig):
     all_nse_tensor = torch.tensor(all_nse_all)
     all_csi_005_tensor = torch.tensor(all_csi_005_all)
     all_csi_030_tensor = torch.tensor(all_csi_030_all)
-    all_mbe_tensor = torch.tensor(all_mbe_all)
+    all_mbe_tensor = torch.tensor(all_mbe_all, dtype=torch.float64)
+    all_mbe_gt_tensor = torch.tensor(all_mbe_gt_all, dtype=torch.float64)
+    all_mass_residual_tensor = torch.tensor(all_mass_residual_all, dtype=torch.float64)
+    all_mass_residual_gt_tensor = torch.tensor(all_mass_residual_gt_all, dtype=torch.float64)
+    all_abs_balance_depth_tensor = torch.tensor(all_abs_balance_depth_all, dtype=torch.float64)
+    all_abs_balance_depth_gt_tensor = torch.tensor(all_abs_balance_depth_gt_all, dtype=torch.float64)
 
     # Per-step averages across hydrographs.
     mean_rmse_per_step = all_rmse_tensor.mean(dim=0)
@@ -430,13 +555,24 @@ def main(cfg: DictConfig):
     mean_csi_005_per_step = torch.nanmean(all_csi_005_tensor, dim=0)
     mean_csi_030_per_step = torch.nanmean(all_csi_030_tensor, dim=0)
     mean_mbe_per_step = all_mbe_tensor.mean(dim=0)
+    mean_mbe_gt_per_step = all_mbe_gt_tensor.mean(dim=0)
+    mean_mass_residual_per_step = all_mass_residual_tensor.mean(dim=0)
+    mean_mass_residual_gt_per_step = all_mass_residual_gt_tensor.mean(dim=0)
+    mean_abs_balance_depth_per_step = all_abs_balance_depth_tensor.mean(dim=0)
+    mean_abs_balance_depth_gt_per_step = all_abs_balance_depth_gt_tensor.mean(dim=0)
 
     print("\n===== Overall Metrics (mean +/- std across hydrographs) =====")
     print(f"RMSE:     {all_rmse_tensor.mean():.4f} +/- {all_rmse_tensor.std():.4f} m")
     print(f"NSE:      {all_nse_tensor.mean():.4f} +/- {all_nse_tensor.std():.4f}")
     print(f"CSI@0.05: {torch.nanmean(all_csi_005_tensor):.4f} +/- {all_csi_005_tensor[~all_csi_005_tensor.isnan()].std():.4f}")
     print(f"CSI@0.3:  {torch.nanmean(all_csi_030_tensor):.4f} +/- {all_csi_030_tensor[~all_csi_030_tensor.isnan()].std():.4f}")
-    print(f"MBE:      {all_mbe_tensor.mean():.6f} +/- {all_mbe_tensor.std():.6f}")
+    print(
+        f"MBE Eq33: {all_mbe_tensor.mean():.6e} +/- "
+        f"{all_mbe_tensor.std():.6e} m^6"
+    )
+    print(f"GT floor: {all_mbe_gt_tensor.mean():.6e} m^6")
+    print(f"Balance depth: {all_abs_balance_depth_tensor.mean():.6e} mm")
+    print(f"GT balance depth: {all_abs_balance_depth_gt_tensor.mean():.6e} mm")
 
     print("\nMean RMSE per rollout step:", mean_rmse_per_step.tolist())
     print("Std RMSE per rollout step:", std_rmse_per_step.tolist())
@@ -449,6 +585,13 @@ def main(cfg: DictConfig):
             "num_hydrographs": len(test_dataset),
             "ckpt_path": str(ckpt_path),
             "epoch_loaded": epoch_loaded,
+            "mbe_definition": "HydroGraphNet Eq. 33 squared global continuity residual",
+            "mbe_unit": "m^6",
+            "mbe_volume_scope": "all 2D mesh nodes",
+            "mbe_delta_t_seconds": delta_t,
+            "mbe_source_convention": "upstream inflow plus rain over impervious area",
+            "mbe_domain_area_m2": domain_area_m2,
+            "mbe_effective_rain_area_m2": effective_rain_area_m2,
         },
         "per_step": {
             "rmse_mean": mean_rmse_per_step.tolist(),
@@ -457,6 +600,11 @@ def main(cfg: DictConfig):
             "csi_005_mean": mean_csi_005_per_step.tolist(),
             "csi_030_mean": mean_csi_030_per_step.tolist(),
             "mbe_mean": mean_mbe_per_step.tolist(),
+            "mbe_gt_mean": mean_mbe_gt_per_step.tolist(),
+            "mass_residual_mean_m3": mean_mass_residual_per_step.tolist(),
+            "mass_residual_gt_mean_m3": mean_mass_residual_gt_per_step.tolist(),
+            "abs_balance_depth_mean_mm": mean_abs_balance_depth_per_step.tolist(),
+            "abs_balance_depth_gt_mean_mm": mean_abs_balance_depth_gt_per_step.tolist(),
         },
         "per_hydrograph": {
             sample_ids[i]: {
@@ -465,6 +613,17 @@ def main(cfg: DictConfig):
                 "mean_csi_005": float(torch.nanmean(all_csi_005_tensor[i])),
                 "mean_csi_030": float(torch.nanmean(all_csi_030_tensor[i])),
                 "mean_mbe": float(all_mbe_tensor[i].mean()),
+                "mean_mbe_gt": float(all_mbe_gt_tensor[i].mean()),
+                "mean_mass_residual_m3": float(all_mass_residual_tensor[i].mean()),
+                "mean_mass_residual_gt_m3": float(all_mass_residual_gt_tensor[i].mean()),
+                "mean_abs_balance_depth_mm": float(all_abs_balance_depth_tensor[i].mean()),
+                "mean_abs_balance_depth_gt_mm": float(all_abs_balance_depth_gt_tensor[i].mean()),
+                "mbe_m6_series": all_mbe_tensor[i].tolist(),
+                "mbe_gt_m6_series": all_mbe_gt_tensor[i].tolist(),
+                "mass_residual_m3_series": all_mass_residual_tensor[i].tolist(),
+                "mass_residual_gt_m3_series": all_mass_residual_gt_tensor[i].tolist(),
+                "abs_balance_depth_gt_mm_series": all_abs_balance_depth_gt_tensor[i].tolist(),
+                "abs_balance_depth_mm_series": all_abs_balance_depth_tensor[i].tolist(),
             }
             for i in range(len(test_dataset))
         },
@@ -476,6 +635,13 @@ def main(cfg: DictConfig):
             "csi_005_mean": float(torch.nanmean(all_csi_005_tensor)),
             "csi_030_mean": float(torch.nanmean(all_csi_030_tensor)),
             "mbe_mean": float(all_mbe_tensor.mean()),
+            "mbe_std": float(all_mbe_tensor.std()),
+            "mbe_gt_mean": float(all_mbe_gt_tensor.mean()),
+            "mass_residual_mean_m3": float(all_mass_residual_tensor.mean()),
+            "mass_residual_gt_mean_m3": float(all_mass_residual_gt_tensor.mean()),
+            "abs_balance_depth_mean_mm": float(all_abs_balance_depth_tensor.mean()),
+            "abs_balance_depth_gt_mean_mm": float(all_abs_balance_depth_gt_tensor.mean()),
+            "mbe_unit": "m^6",
         },
     }
     metrics_path = os.path.join(anim_output_dir, "metrics.json")
