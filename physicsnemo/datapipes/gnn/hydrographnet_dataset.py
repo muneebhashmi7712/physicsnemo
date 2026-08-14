@@ -80,7 +80,6 @@ class UrbanFloodDataset(Dataset):
         edge_q_prev_as_input: bool = False,
         lmc_antisymmetric: bool = False,
         train_rollout_length: int = 1,
-        static_prediction: bool = False,
         full_event_rollout: bool = False,
     ):
         if split not in {"train", "test"}:
@@ -112,7 +111,6 @@ class UrbanFloodDataset(Dataset):
         # single graph (one forward pass, no rollout/window); node input gets a
         # per-event total-rainfall scalar instead of the per-step precip/window,
         # and the target is per-node peak depth above ground.
-        self.static_prediction = static_prediction
 
         self.static_data = {}
         self.dynamic_data = []
@@ -343,23 +341,10 @@ class UrbanFloodDataset(Dataset):
         volume_list = []
         precipitation_list = []
         inflow_list = []
-        event_total_rain = []  # v9: per-event total inches (one scalar per event)
 
         # v9: physical elevation (per node) for peak-depth-above-ground targets.
         # static_stats["elevation"] is populated for both splits (train computes
         # it; test loads it), so denormalising recovers physical ground elevation.
-        if self.static_prediction:
-            elev_2d_phys = self.denormalize(
-                self.static_data["elevation"],
-                self.static_stats["elevation"]["mean"],
-                self.static_stats["elevation"]["std"],
-            ).reshape(-1)  # (N_2d,)
-            if self.use_1d:
-                surf_1d_phys = self.denormalize(
-                    self.static_data["surface_elev_1d"],
-                    self.static_stats["elevation"]["mean"],
-                    self.static_stats["elevation"]["std"],
-                ).reshape(-1)  # (N_1d,)
 
         for event_id in self.event_ids:
             event_dir = os.path.join(self.split_dir, event_id)
@@ -379,16 +364,6 @@ class UrbanFloodDataset(Dataset):
                 "event_id": event_id,
             }
 
-            if self.static_prediction:
-                # rainfall column is already per-step inches, so the sum is the
-                # event total inches (matches compute_event_intensity.py).
-                sample["event_total_rain"] = float(rainfall.sum())
-                sample["n_timesteps"] = int(water_level.shape[0])
-                # Per-node peak depth above ground over the whole event.
-                peak_2d = np.clip(
-                    water_level - elev_2d_phys[None, :], 0.0, None
-                ).max(axis=0)  # (N_2d,)
-                sample["peak_depth_phys"] = peak_2d
 
             if self.use_1d:
                 wl_1d, inlet_flow_1d, vol_1d = self.load_1d_dynamic_data(
@@ -404,17 +379,8 @@ class UrbanFloodDataset(Dataset):
                 sample["volume"] = np.concatenate([volume, vol_1d], axis=1)
                 sample["edge_flow_1d"] = edge_flow_1d
                 sample["inlet_flow_1d"] = inlet_flow_1d  # used as connection-edge GT
-                if self.static_prediction:
-                    peak_1d = np.clip(
-                        wl_1d - surf_1d_phys[None, :], 0.0, None
-                    ).max(axis=0)  # (N_1d,)
-                    sample["peak_depth_phys"] = np.concatenate(
-                        [sample["peak_depth_phys"], peak_1d]
-                    )
 
             temp_dynamic_data.append(sample)
-            if self.static_prediction:
-                event_total_rain.append(sample["event_total_rain"])
             water_depth_list.append(sample["water_depth"].flatten())
             volume_list.append(sample["volume"].flatten())
             precipitation_list.append(rainfall.flatten())
@@ -494,7 +460,7 @@ class UrbanFloodDataset(Dataset):
             }
 
             # v2: per-edge-type flow std (no mean — flows are signed). These
-            # are scales for raw m³/s flows, so the conversion to "vol per
+            # are scales for raw ft³/s flows, so the conversion to "vol per
             # step" units is `flow_phys * delta_t / sigma_phys` where
             # sigma_phys is the correct edge-type std.
             if self.use_1d:
@@ -521,7 +487,7 @@ class UrbanFloodDataset(Dataset):
                     "std": float(np.std(conn_flow_all))
                 }
                 logger.info(
-                    f"v2 per-edge-type flow std (raw m³/s) — "
+                    f"v2 per-edge-type flow std (raw ft³/s) — "
                     f"2D = {self.dynamic_stats['edge_flow_2d']['std']:.4f}; "
                     f"1D = {self.dynamic_stats['edge_flow_1d']['std']:.4f}; "
                     f"conn = {self.dynamic_stats['edge_flow_conn']['std']:.4f}"
@@ -530,39 +496,6 @@ class UrbanFloodDataset(Dataset):
             # v9: per-event rain-scalar stats + per-node peak-depth target stats
             # (train-only; test loads them below). Following the per-type
             # convention so the 2D-only metric stays governing under use_1d.
-            if self.static_prediction:
-                self.dynamic_stats["event_rain_scalar"] = {
-                    "mean": float(np.mean(event_total_rain)),
-                    "std": float(np.std(event_total_rain)),
-                }
-                if self.use_1d:
-                    pk2 = np.concatenate(
-                        [s["peak_depth_phys"][:N_2d] for s in temp_dynamic_data]
-                    )
-                    pk1 = np.concatenate(
-                        [s["peak_depth_phys"][N_2d:] for s in temp_dynamic_data]
-                    )
-                    pk2_stats = {"mean": float(np.mean(pk2)), "std": float(np.std(pk2))}
-                    pk1_stats = {"mean": float(np.mean(pk1)), "std": float(np.std(pk1))}
-                    self.dynamic_stats["peak_depth"] = {
-                        "2d": pk2_stats, "1d": pk1_stats,
-                        "mean": pk2_stats["mean"], "std": pk2_stats["std"],
-                    }
-                else:
-                    pk = np.concatenate(
-                        [s["peak_depth_phys"] for s in temp_dynamic_data]
-                    )
-                    self.dynamic_stats["peak_depth"] = {
-                        "mean": float(np.mean(pk)), "std": float(np.std(pk)),
-                    }
-                logger.info(
-                    f"v9 static stats — rain scalar mean/std = "
-                    f"{self.dynamic_stats['event_rain_scalar']['mean']:.3f}/"
-                    f"{self.dynamic_stats['event_rain_scalar']['std']:.3f}; "
-                    f"peak depth mean/std = "
-                    f"{self.dynamic_stats['peak_depth']['mean']:.4f}/"
-                    f"{self.dynamic_stats['peak_depth']['std']:.4f}"
-                )
 
             self.save_norm_stats(self.dynamic_stats, DYNAMIC_NORM_STATS_FILE)
         else:
@@ -612,28 +545,17 @@ class UrbanFloodDataset(Dataset):
                     self.dynamic_stats["inflow_hydrograph"]["mean"],
                     self.dynamic_stats["inflow_hydrograph"]["std"],
                 ),
-                "edge_flow": dyn["edge_flow"],  # raw m³/s, converted at __getitem__ time
+                "edge_flow": dyn["edge_flow"],  # raw ft³/s, converted at __getitem__ time
                 "event_id": dyn["event_id"],
             }
             if self.use_1d:
-                # raw m³/s for 1D pipe edges and inlet flows; converted at __getitem__ time
+                # raw ft³/s for 1D pipe edges and inlet flows; converted at __getitem__ time
                 dyn_std["edge_flow_1d"] = dyn["edge_flow_1d"]
                 dyn_std["inlet_flow_1d"] = dyn["inlet_flow_1d"]
-            if self.static_prediction:
-                dyn_std["peak_depth_phys"] = dyn["peak_depth_phys"]
-                dyn_std["event_total_rain"] = dyn["event_total_rain"]
-                dyn_std["n_timesteps"] = dyn["n_timesteps"]
             self.dynamic_data.append(dyn_std)
 
         # --- Build sample indices ---
-        if self.static_prediction:
-            # One graph per event for BOTH splits — no time window, no rollout.
-            self.length = len(self.dynamic_data)
-            logger.info(
-                f"Static prediction: {self.length} event-level samples "
-                f"({self.split})."
-            )
-        elif self.split == "train":
+        if self.split == "train":
             # For multi-step training rollout (DUALFloodGNN regime), we need
             # `train_rollout_length` consecutive future timesteps after the
             # input window. With pushforward the input window already needs
@@ -724,131 +646,8 @@ class UrbanFloodDataset(Dataset):
             sd["manning"], sd["flow_accum"], sd["infiltration"], None,
         )
 
-    def _attach_steady_physics(self, g, dyn):
-        """Populate steady-state mass-conservation tensors on the graph (v9).
-
-        Mirrors the per-edge sigma / per-node V_std plumbing of the
-        autoregressive path, but with edge_q_prev=0 (the edge decoder
-        predicts the steady flow Q directly) and a rainfall-derived source
-        term S_phys = inches_m * area / T_steps (m³/step). At the storm peak
-        dV/dt≈0, so steady continuity is net_flow + S = 0.
-        """
-        sd = self.static_data
-        num_nodes_s = (
-            self.num_2d_nodes + self.num_1d_nodes if self.use_1d
-            else sd["xy_coords"].shape[0]
-        )
-        if self.use_1d:
-            V_std_2d = self.dynamic_stats["volume"]["2d"]["std"]
-            V_std_1d = self.dynamic_stats["volume"]["1d"]["std"]
-            sigma_2d_phys = self.dynamic_stats["edge_flow_2d"]["std"] * self.delta_t
-            sigma_1d_phys = self.dynamic_stats["edge_flow_1d"]["std"] * self.delta_t
-            sigma_cn_phys = self.dynamic_stats["edge_flow_conn"]["std"] * self.delta_t
-            sigma_per_edge = np.concatenate([
-                np.full(2 * self.num_fwd_edges,    sigma_2d_phys, dtype=np.float64),
-                np.full(2 * self.num_1d_fwd_edges, sigma_1d_phys, dtype=np.float64),
-                np.full(2 * self.num_conn_edges,   sigma_cn_phys, dtype=np.float64),
-            ])
-            V_std_per_node = np.concatenate([
-                np.full(self.num_2d_nodes, V_std_2d, dtype=np.float64),
-                np.full(self.num_1d_nodes, V_std_1d, dtype=np.float64),
-            ])
-            area_node = np.concatenate([
-                sd["area_denorm"].reshape(-1),
-                sd["base_area_1d_denorm"].reshape(-1),
-            ])
-        else:
-            V_std_shared = self.dynamic_stats["volume"]["std"]
-            sigma_per_edge = np.full(
-                2 * self.num_fwd_edges, V_std_shared, dtype=np.float64
-            )
-            V_std_per_node = np.full(num_nodes_s, V_std_shared, dtype=np.float64)
-            area_node = sd["area_denorm"].reshape(-1)
-
-        # Source term: total rain volume per node, spread over the event steps.
-        inches_m = float(dyn["event_total_rain"]) * 0.0254
-        T_steps = max(1, int(dyn["n_timesteps"]))
-        S_phys = inches_m * area_node / T_steps                  # (N,) m³/step
-
-        E_total = sigma_per_edge.shape[0]
-        g.edge_q_prev = torch.zeros(E_total, dtype=torch.float)
-        g.Q_sigma_per_edge_phys = torch.tensor(sigma_per_edge, dtype=torch.float)
-        g.V_std_per_node = torch.tensor(V_std_per_node, dtype=torch.float)
-        g.source_term = torch.tensor(S_phys / V_std_per_node, dtype=torch.float)
-        if self.use_1d and self.lmc_antisymmetric and hasattr(
-            self, "is_forward_edge_mask"
-        ):
-            g.is_forward_edge = torch.from_numpy(self.is_forward_edge_mask).bool()
-
-    def _getitem_static(self, idx: int):
-        """v9 time-less peak-depth sample: one graph per event."""
-        sd = self.static_data
-        dyn = self.dynamic_data[idx]
-        (
-            xy, area, elev, slope, aspect, curv,
-            manning, flow_accum, infilt, extra,
-        ) = self._static_blocks()
-
-        num_nodes = xy.shape[0]
-        rs = self.dynamic_stats["event_rain_scalar"]
-        rain_norm = (dyn["event_total_rain"] - rs["mean"]) / (rs["std"] + 1e-8)
-        rain_col = np.full((num_nodes, 1), rain_norm, dtype=xy.dtype)
-
-        blocks = [xy, area, elev, slope, aspect, curv, manning, flow_accum, infilt]
-        if extra is not None:
-            blocks.append(extra)
-        blocks.append(rain_col)
-        node_features = np.hstack(blocks)
-
-        peak_phys = dyn["peak_depth_phys"]
-        if self.use_1d:
-            pd2 = self.dynamic_stats["peak_depth"]["2d"]
-            pd1 = self.dynamic_stats["peak_depth"]["1d"]
-            peak_norm = np.concatenate([
-                (peak_phys[: self.num_2d_nodes] - pd2["mean"]) / (pd2["std"] + 1e-8),
-                (peak_phys[self.num_2d_nodes:] - pd1["mean"]) / (pd1["std"] + 1e-8),
-            ])
-        else:
-            pds = self.dynamic_stats["peak_depth"]
-            peak_norm = (peak_phys - pds["mean"]) / (pds["std"] + 1e-8)
-
-        src, dst = sd["edge_index"]
-        edges = torch.stack([torch.tensor(src), torch.tensor(dst)], dim=0).long()
-        g = pyg.data.Data(edge_index=edges)
-        g.edge_attr = torch.tensor(sd["edge_features"], dtype=torch.float)
-        g.x = torch.tensor(node_features, dtype=torch.float)
-        g.y = torch.tensor(peak_norm, dtype=torch.float).unsqueeze(-1)  # (N, 1)
-
-        if self.use_1d:
-            g.node_type = torch.tensor(
-                np.concatenate([
-                    np.zeros(self.num_2d_nodes, dtype=np.int64),
-                    np.ones(self.num_1d_nodes, dtype=np.int64),
-                ]),
-                dtype=torch.long,
-            )
-        if "boundary_mask" in sd:
-            g.boundary_mask = torch.tensor(sd["boundary_mask"], dtype=torch.bool)
-
-        if self.return_physics and self.num_fwd_edges > 0:
-            self._attach_steady_physics(g, dyn)
-
-        if self.split == "test":
-            meta = {
-                "event_id": dyn["event_id"],
-                "peak_depth_phys": torch.tensor(peak_phys, dtype=torch.float),
-            }
-            return g, meta
-        if self.return_physics:
-            # Per-node physics lives on `g`; the dict is only for collate's
-            # (graph, physics_data) contract.
-            return g, {}
-        return g
-
     def __getitem__(self, idx: int):
         """Retrieve a graph sample."""
-        if self.static_prediction:
-            return self._getitem_static(idx)
         sd = self.static_data
         if self.split != "test":
             # --- Training mode: sliding window ---
@@ -946,7 +745,7 @@ class UrbanFloodDataset(Dataset):
             # Edge flow targets: delta-Q and Q_prev. v2 normalises per-edge by
             # the edge-type's flow std and per-node by the node-type's volume
             # std, so the conservation residual can be formed in physical
-            # units (m³) and then made dimensionless by dividing by the
+            # units (ft³) and then made dimensionless by dividing by the
             # per-node volume std.
             if self.return_physics and self.num_fwd_edges > 0:
                 num_nodes_s = (
@@ -1007,7 +806,7 @@ class UrbanFloodDataset(Dataset):
                     flow_prev_bi  = np.concatenate([flow_prev_fwd, -flow_prev_fwd])
                     flow_targ_bi  = np.concatenate([flow_targ_fwd, -flow_targ_fwd])
 
-                # Q in physical units (m³ per step) and normalised by per-edge sigma.
+                # Q in physical units (ft³ per step) and normalised by per-edge sigma.
                 Q_prev_phys   = flow_prev_bi * self.delta_t
                 Q_target_phys = flow_targ_bi * self.delta_t
                 Q_prev_norm   = Q_prev_phys / sigma_per_edge
@@ -1052,7 +851,7 @@ class UrbanFloodDataset(Dataset):
                 Q_out_phys = np.zeros(num_nodes_s)
                 np.add.at(Q_out_phys, src, Q_target_phys)
                 net_flow_phys = (Q_in_phys - Q_out_phys) / 2.0
-                S_phys = delta_V_phys - net_flow_phys              # m³
+                S_phys = delta_V_phys - net_flow_phys              # ft³
                 g.source_term = torch.tensor(
                     S_phys / V_std_per_node, dtype=torch.float
                 )
@@ -1329,6 +1128,19 @@ class UrbanFloodDataset(Dataset):
                     dyn["precipitation"][self.n_time_steps : _end],
                     dtype=torch.float,
                 ),
+                # UrbanFlood rainfall is an interval depth (inches per stored
+                # step), while inlet_flow_1d is a signed interval-average
+                # discharge (ft^3/s). Their aligned raw values let inference
+                # build the 2D-domain external source for Equation 33 without
+                # confusing either quantity with a normalized model feature.
+                "drainage_outflow": torch.tensor(
+                    np.sum(
+                        dyn["inlet_flow_1d"][self.n_time_steps : _end], axis=1
+                    ) if self.use_1d else np.zeros(
+                        dyn["precipitation"][self.n_time_steps : _end].shape[0]
+                    ),
+                    dtype=torch.float64,
+                ),
                 "water_depth_gt": torch.tensor(
                     dyn["water_depth"][self.n_time_steps : _end],
                     dtype=torch.float,
@@ -1527,7 +1339,7 @@ class UrbanFloodDataset(Dataset):
         """Load dynamic 2D edge flow data from a single event CSV.
 
         Returns:
-            edge_flow: shape (T, num_edges) — flow rate per forward edge per timestep (m³/s).
+            edge_flow: shape (T, num_edges) — flow rate per forward edge per timestep (ft³/s).
         """
         csv_path = os.path.join(event_dir, "2d_edges_dynamic_all.csv")
         # Columns: timestep, edge_idx, flow, velocity
@@ -1784,8 +1596,8 @@ class UrbanFloodDataset(Dataset):
 
         Returns:
             water_level: (T, N_1d) — m
-            inlet_flow:  (T, N_1d) — m^3/s
-            volume:      (T, N_1d) — m^3 (synthesised)
+            inlet_flow:  (T, N_1d) — ft^3/s
+            volume:      (T, N_1d) — ft^3 (synthesised)
         """
         path = os.path.join(event_dir, "1d_nodes_dynamic_all.csv")
         # timestep, node_idx, water_level, inlet_flow
@@ -1798,7 +1610,7 @@ class UrbanFloodDataset(Dataset):
         return water_level, inlet_flow, volume
 
     def load_1d_edge_dynamic_data(self, event_dir, num_1d_edges):
-        """Load dynamic 1D pipe flow data. Returns (T, num_1d_edges) m^3/s."""
+        """Load dynamic 1D pipe flow data. Returns (T, num_1d_edges) ft^3/s."""
         path = os.path.join(event_dir, "1d_edges_dynamic_all.csv")
         # timestep, edge_idx, flow, velocity
         raw = np.genfromtxt(path, delimiter=",", skip_header=1)

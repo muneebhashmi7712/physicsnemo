@@ -23,7 +23,7 @@ For each test event, generates a four-panel animation:
   1. Prediction (node colors = predicted water depth above ground)
   2. Ground Truth (node colors = actual water depth above ground)
   3. Absolute Error
-  4. RMSE curve over time (in meters)
+  4. RMSE curve over time (in feet)
 """
 
 import os
@@ -39,7 +39,12 @@ from omegaconf import DictConfig, OmegaConf
 from hydra.utils import to_absolute_path
 
 from physicsnemo.utils import load_checkpoint
-from metrics import compute_nse, compute_csi
+from metrics import (
+    compute_csi,
+    compute_mass_balance_error,
+    compute_mass_balance_residual,
+    compute_nse,
+)
 
 from physicsnemo.datapipes.gnn.hydrographnet_dataset import UrbanFloodDataset
 from physicsnemo.models.meshgraphnet.meshgraphkan import MeshGraphKAN
@@ -60,10 +65,10 @@ def create_animation(
     Create a four-panel animation for one event rollout.
 
     Parameters:
-      rollout_predictions: list of predicted water depth above ground tensors (meters)
-      ground_truth: list of ground truth water depth above ground tensors (meters)
+      rollout_predictions: list of predicted water depth above ground tensors (feet)
+      ground_truth: list of ground truth water depth above ground tensors (feet)
       initial_graph: the initial PyG graph sample (used for node positions and edges)
-      rmse_list: list of RMSE values in meters computed at each rollout step
+      rmse_list: list of RMSE values in feet computed at each rollout step
       output_path: file path to save the animation (e.g. a GIF file)
       time_per_step: simulation time (in hours) corresponding to each rollout step.
     """
@@ -115,7 +120,7 @@ def create_animation(
         )
         nx.draw_networkx_edges(g_pred, pos, alpha=0.5, ax=axes[0, 0])
         axes[0, 0].set_title(f"Time {current_time:.2f} Hours - Prediction", fontsize=24)
-        fig.colorbar(nodes_pred, cax=cax1, label="Depth (m)")
+        fig.colorbar(nodes_pred, cax=cax1, label="Depth (ft)")
 
         # Panel 2: Ground Truth.
         gt_vals = ground_truth[frame].cpu().numpy()
@@ -136,7 +141,7 @@ def create_animation(
         axes[0, 1].set_title(
             f"Time {current_time:.2f} Hours - Ground Truth", fontsize=24
         )
-        fig.colorbar(nodes_gt, cax=cax2, label="Depth (m)")
+        fig.colorbar(nodes_gt, cax=cax2, label="Depth (ft)")
 
         # Panel 3: Absolute Error.
         abs_error = torch.abs(rollout_predictions[frame] - ground_truth[frame])
@@ -158,7 +163,7 @@ def create_animation(
         axes[1, 0].set_title(
             f"Time {current_time:.2f} Hours - Absolute Error", fontsize=24
         )
-        fig.colorbar(nodes_error, cax=cax3, label="Error (m)")
+        fig.colorbar(nodes_error, cax=cax3, label="Error (ft)")
 
         # Panel 4: RMSE Curve.
         times = [(i + 1) * time_per_step for i in range(frame + 1)]
@@ -171,7 +176,7 @@ def create_animation(
         )
         axes[1, 1].set_title("RMSE Over Time", fontsize=24)
         axes[1, 1].set_xlabel("Time (Hours)", fontsize=24)
-        axes[1, 1].set_ylabel("RMSE (m)", fontsize=24)
+        axes[1, 1].set_ylabel("RMSE (ft)", fontsize=24)
         axes[1, 1].legend(fontsize=20)
         axes[1, 1].grid(True)
 
@@ -210,7 +215,6 @@ def main(cfg: DictConfig):
 
     # Instantiate the test dataset.
     use_1d = cfg.get("use_1d", False)
-    static_prediction = bool(cfg.get("static_prediction", False))
     edge_q_prev_as_input = bool(cfg.get("edge_q_prev_as_input", False))
     test_dataset = UrbanFloodDataset(
         data_dir=data_dir,
@@ -222,7 +226,6 @@ def main(cfg: DictConfig):
         use_1d=use_1d,
         edge_q_prev_as_input=bool(cfg.get("edge_q_prev_as_input", False)),
         lmc_antisymmetric=bool(cfg.get("lmc_antisymmetric", False)),
-        static_prediction=static_prediction,
         full_event_rollout=full_event,
     )
     print(f"Loaded test dataset with {len(test_dataset)} events.")
@@ -239,6 +242,21 @@ def main(cfg: DictConfig):
         wd_std_2d  = wd_stats["2d"]["std"]
         wd_mean_1d = wd_stats["1d"]["mean"]
         wd_std_1d  = wd_stats["1d"]["std"]
+    vol_stats = test_dataset.dynamic_stats["volume"]
+    vol_mean = vol_stats["mean"]
+    vol_std = vol_stats["std"]
+    if use_1d:
+        vol_mean_2d = vol_stats["2d"]["mean"]
+        vol_std_2d = vol_stats["2d"]["std"]
+        vol_mean_1d = vol_stats["1d"]["mean"]
+        vol_std_1d = vol_stats["1d"]["std"]
+    precip_stats = test_dataset.dynamic_stats["precipitation"]
+    precip_mean = precip_stats["mean"]
+    precip_std = precip_stats["std"]
+    delta_t = float(cfg.get("delta_t", 300.0))
+    area_sum_2d_ft2 = float(np.sum(test_dataset.static_data["area_denorm"]))
+    ft3_to_m3 = 0.028316846592
+    ft6_to_m6 = ft3_to_m3 ** 2
     elev_mean_raw = test_dataset.static_stats["elevation"]["mean"]
     elev_std_raw = test_dataset.static_stats["elevation"]["std"]
     # Static stats may be stored as single-element lists.
@@ -293,72 +311,6 @@ def main(cfg: DictConfig):
     # Emits per-event + summary lines in the exact v8 log format so the
     # existing aggregator parses it unchanged (summary as 1-element tensors).
     # ------------------------------------------------------------------
-    if static_prediction:
-        pd_stats = test_dataset.dynamic_stats["peak_depth"]
-        ev_2d, ev_1d, ev_all = [], [], []
-        with torch.no_grad():
-            for idx in range(len(test_dataset)):
-                g, meta = test_dataset[idx]
-                g = g.to(device)
-                node_type = g.node_type.to(device) if hasattr(g, "node_type") else None
-                out = model(g.x.to(device), g.edge_attr.to(device), g)
-                pred = out[0] if isinstance(out, tuple) else out  # (N, 1)
-                pred = pred.squeeze(-1)
-
-                if use_1d and node_type is not None:
-                    is_1d = (node_type == 1)
-                    mean_pn = torch.where(
-                        is_1d,
-                        torch.tensor(pd_stats["1d"]["mean"], device=device, dtype=pred.dtype),
-                        torch.tensor(pd_stats["2d"]["mean"], device=device, dtype=pred.dtype),
-                    )
-                    std_pn = torch.where(
-                        is_1d,
-                        torch.tensor(pd_stats["1d"]["std"], device=device, dtype=pred.dtype),
-                        torch.tensor(pd_stats["2d"]["std"], device=device, dtype=pred.dtype),
-                    )
-                else:
-                    mean_pn = pd_stats["mean"]
-                    std_pn = pd_stats["std"]
-
-                pred_phys = torch.clamp(pred * (std_pn + epsilon) + mean_pn, min=0.0)
-                gt_phys = meta["peak_depth_phys"].to(device)
-
-                rmse = torch.sqrt(torch.mean((pred_phys - gt_phys) ** 2)).item()
-                ev_all.append(rmse)
-                sample_id = meta["event_id"]
-                if node_type is not None:
-                    m2 = node_type == 0
-                    m1 = node_type == 1
-                    r2 = torch.sqrt(torch.mean((pred_phys[m2] - gt_phys[m2]) ** 2)).item()
-                    r1 = torch.sqrt(torch.mean((pred_phys[m1] - gt_phys[m1]) ** 2)).item()
-                    ev_2d.append(r2)
-                    ev_1d.append(r1)
-                    print(
-                        f"Event {sample_id}: Mean RMSE = {rmse:.4f} m | "
-                        f"2D = {r2:.4f} m | 1D = {r1:.4f} m"
-                    )
-                else:
-                    print(f"Event {sample_id}: Mean RMSE = {rmse:.4f} m")
-
-        # Summary as 1-element tensors (peak-depth has no rollout dimension).
-        mean_all = sum(ev_all) / len(ev_all)
-        print(
-            "Overall Mean RMSE (m) over rollout steps:",
-            torch.tensor([mean_all]),
-        )
-        print("Overall Std RMSE (m) over rollout steps:", torch.tensor([float(np.std(ev_all))]))
-        if ev_2d:
-            print("Overall Mean RMSE — 2D nodes:", torch.tensor([sum(ev_2d) / len(ev_2d)]))
-            print("Overall Std  RMSE — 2D nodes:", torch.tensor([float(np.std(ev_2d))]))
-            print("Overall Mean RMSE — 1D nodes:", torch.tensor([sum(ev_1d) / len(ev_1d)]))
-            print("Overall Std  RMSE — 1D nodes:", torch.tensor([float(np.std(ev_1d))]))
-        else:
-            # 2D-only run: surface line is the same as overall.
-            print("Overall Mean RMSE — 2D nodes:", torch.tensor([mean_all]))
-            print("Overall Std  RMSE — 2D nodes:", torch.tensor([float(np.std(ev_all))]))
-        print(f"Static peak-depth inference done over {len(ev_all)} events.")
-        return
 
     all_rmse_all = []
     all_rmse_2d = []   # per-event RMSE on 2D nodes only (use_1d case)
@@ -368,7 +320,7 @@ def main(cfg: DictConfig):
     # error, mirroring the HydrographNet combo-holdout metrics.json so the two
     # datasets are compared with identical definitions. 2D is the governing
     # field for UrbanFlood (1D is an input, not a target).
-    tau_wet = float(cfg.get("scalefree_tau", 0.01))  # min GT std (m) for NSE conditioning
+    tau_wet = float(cfg.get("scalefree_tau", 0.01))  # min GT std (ft) for NSE conditioning
     per_hydrograph = {}
 
     # Loop over each test event.
@@ -393,11 +345,21 @@ def main(cfg: DictConfig):
         csi030_2d_list = []
         rmse_over_sigma_list = []  # companion global RSR = RMSE_2d / max(std_gt, tau)
         nse_2d_series = []         # step-aligned NSE (NaN on unconditioned steps)
-        sd_gt_2d_list = []         # per-step GT spatial std (m)
+        sd_gt_2d_list = []         # per-step GT spatial std (ft)
+        mbe_ft6_list = []
+        mbe_m6_list = []
+        mbe_gt_ft6_list = []
+        mbe_gt_m6_list = []
+        mass_residual_ft3_list = []
+        mass_residual_gt_ft3_list = []
+        balance_depth_mm_list = []
+        balance_depth_gt_mm_list = []
 
         inflow_seq = rollout_data["inflow"].to(device)
         precip_seq = rollout_data["precipitation"].to(device)
+        drainage_outflow_seq = rollout_data["drainage_outflow"].to(device)
         wd_gt_seq = rollout_data["water_depth_gt"].to(device)
+        vol_gt_seq = rollout_data["volume_gt"].to(device)
         # Per-event rollout length = returned GT sequence length. In full-event
         # mode this is the event's own length; otherwise the fixed global window.
         n_steps_ev = wd_gt_seq.shape[0]
@@ -423,9 +385,30 @@ def main(cfg: DictConfig):
                 torch.tensor(wd_std_1d, device=device, dtype=X_current.dtype),
                 torch.tensor(wd_std_2d, device=device, dtype=X_current.dtype),
             )
+            vol_mean_per_node = torch.where(
+                is_1d,
+                torch.tensor(vol_mean_1d, device=device, dtype=torch.float64),
+                torch.tensor(vol_mean_2d, device=device, dtype=torch.float64),
+            )
+            vol_std_per_node = torch.where(
+                is_1d,
+                torch.tensor(vol_std_1d, device=device, dtype=torch.float64),
+                torch.tensor(vol_std_2d, device=device, dtype=torch.float64),
+            )
         else:
             wd_mean_per_node = wd_mean
             wd_std_per_node  = wd_std
+            vol_mean_per_node = torch.full(
+                (num_nodes,), float(vol_mean), device=device, dtype=torch.float64
+            )
+            vol_std_per_node = torch.full(
+                (num_nodes,), float(vol_std), device=device, dtype=torch.float64
+            )
+        mbe_mask = (
+            node_type == 0
+            if node_type is not None
+            else torch.ones(num_nodes, device=device, dtype=torch.bool)
+        )
 
         # Determine the static block width once. The dynamic block (water_depth
         # window + volume window) is always at the END of the row, so:
@@ -483,6 +466,87 @@ def main(cfg: DictConfig):
             pred_depth = torch.clamp(pred_wl - elev_real, min=0.0)
             gt_depth = torch.clamp(gt_wl - elev_real, min=0.0)
 
+            # HydroGraphNet paper Eq. 33 on the governing 2D surface domain.
+            # UF rainfall is already an interval depth in inches, so convert it
+            # to an interval-average source rate. inlet_flow_1d is the signed
+            # drainage discharge leaving the 2D surface. Passing the same
+            # interval-average rate at both endpoints makes Eq. 33's trapezoid
+            # integral equal the source volume represented by this stored step.
+            previous_vol_norm = volume_window[:, -1]
+            gt_previous_vol_norm = (
+                previous_vol_norm if t == 0 else vol_gt_seq[t - 1]
+            )
+            pred_vol_real = (
+                new_vol.squeeze(1).to(torch.float64)
+                * (vol_std_per_node + epsilon)
+                + vol_mean_per_node
+            )
+            previous_pred_vol_real = (
+                previous_vol_norm.to(torch.float64)
+                * (vol_std_per_node + epsilon)
+                + vol_mean_per_node
+            )
+            gt_vol_real = (
+                vol_gt_seq[t].to(torch.float64)
+                * (vol_std_per_node + epsilon)
+                + vol_mean_per_node
+            )
+            previous_gt_vol_real = (
+                gt_previous_vol_norm.to(torch.float64)
+                * (vol_std_per_node + epsilon)
+                + vol_mean_per_node
+            )
+            precip_in = (
+                precip_seq[t].to(torch.float64) * (precip_std + epsilon)
+                + precip_mean
+            )
+            rainfall_rate_ft3_s = (
+                precip_in * area_sum_2d_ft2 / 12.0 / delta_t
+            )
+            net_source_rate_ft3_s = (
+                rainfall_rate_ft3_s - drainage_outflow_seq[t]
+            )
+            mass_residual_ft3 = compute_mass_balance_residual(
+                pred_vol_real[mbe_mask],
+                previous_pred_vol_real[mbe_mask],
+                net_source_rate_ft3_s,
+                net_source_rate_ft3_s,
+                delta_t,
+            )
+            mbe_ft6 = compute_mass_balance_error(
+                pred_vol_real[mbe_mask],
+                previous_pred_vol_real[mbe_mask],
+                net_source_rate_ft3_s,
+                net_source_rate_ft3_s,
+                delta_t,
+            )
+            mass_residual_gt_ft3 = compute_mass_balance_residual(
+                gt_vol_real[mbe_mask],
+                previous_gt_vol_real[mbe_mask],
+                net_source_rate_ft3_s,
+                net_source_rate_ft3_s,
+                delta_t,
+            )
+            mbe_gt_ft6 = compute_mass_balance_error(
+                gt_vol_real[mbe_mask],
+                previous_gt_vol_real[mbe_mask],
+                net_source_rate_ft3_s,
+                net_source_rate_ft3_s,
+                delta_t,
+            )
+            mbe_ft6_list.append(mbe_ft6)
+            mbe_m6_list.append(mbe_ft6 * ft6_to_m6)
+            mbe_gt_ft6_list.append(mbe_gt_ft6)
+            mbe_gt_m6_list.append(mbe_gt_ft6 * ft6_to_m6)
+            mass_residual_ft3_list.append(mass_residual_ft3)
+            mass_residual_gt_ft3_list.append(mass_residual_gt_ft3)
+            balance_depth_mm_list.append(
+                abs(mass_residual_ft3) / area_sum_2d_ft2 * 304.8
+            )
+            balance_depth_gt_mm_list.append(
+                abs(mass_residual_gt_ft3) / area_sum_2d_ft2 * 304.8
+            )
+
             rollout_preds.append(pred_depth.detach().cpu())
             ground_truth_list.append(gt_depth.detach().cpu())
 
@@ -530,12 +594,16 @@ def main(cfg: DictConfig):
         sample_id = test_dataset.dynamic_data[idx].get("event_id", idx)
         if rmse_2d_list and rmse_1d_list:
             print(
-                f"Event {sample_id}: Mean RMSE = {mean_rmse_sample:.4f} m | "
-                f"2D = {sum(rmse_2d_list)/len(rmse_2d_list):.4f} m | "
-                f"1D = {sum(rmse_1d_list)/len(rmse_1d_list):.4f} m"
+                f"Event {sample_id}: Mean RMSE = {mean_rmse_sample:.4f} ft | "
+                f"2D = {sum(rmse_2d_list)/len(rmse_2d_list):.4f} ft | "
+                f"1D = {sum(rmse_1d_list)/len(rmse_1d_list):.4f} ft"
             )
         else:
-            print(f"Event {sample_id}: Mean RMSE = {mean_rmse_sample:.4f} m")
+            print(f"Event {sample_id}: Mean RMSE = {mean_rmse_sample:.4f} ft")
+        print(
+            f"Event {sample_id}: Eq33 MBE={sum(mbe_m6_list)/len(mbe_m6_list):.6e} m^6 "
+            f"| GT floor={sum(mbe_gt_m6_list)/len(mbe_gt_m6_list):.6e} m^6"
+        )
 
         # Phase A: record per-event 2D-only scale-free metrics for metrics.json.
         def _nanmean(xs):
@@ -558,11 +626,27 @@ def main(cfg: DictConfig):
             if rmse_over_sigma_list else float("nan")
         )
         per_hydrograph[str(sample_id)] = {
-            "mean_rmse": mean_rmse_2d,            # 2D-only, meters (governing field)
+            "mean_rmse": mean_rmse_2d,            # 2D-only, feet (governing field)
             "mean_rmse_allnodes": mean_rmse_sample,
             "mean_nse": mean_nse_2d,
             "mean_csi_005": _nanmean(csi005_2d_list),
             "mean_csi_030": _nanmean(csi030_2d_list),
+            "mean_mbe": sum(mbe_ft6_list) / len(mbe_ft6_list),
+            "mean_mbe_m6": sum(mbe_m6_list) / len(mbe_m6_list),
+            "mean_mbe_gt": sum(mbe_gt_ft6_list) / len(mbe_gt_ft6_list),
+            "mean_mbe_gt_m6": sum(mbe_gt_m6_list) / len(mbe_gt_m6_list),
+            "mean_mass_residual_ft3": (
+                sum(mass_residual_ft3_list) / len(mass_residual_ft3_list)
+            ),
+            "mean_mass_residual_gt_ft3": (
+                sum(mass_residual_gt_ft3_list) / len(mass_residual_gt_ft3_list)
+            ),
+            "mean_abs_balance_depth_mm": (
+                sum(balance_depth_mm_list) / len(balance_depth_mm_list)
+            ),
+            "mean_abs_balance_depth_gt_mm": (
+                sum(balance_depth_gt_mm_list) / len(balance_depth_gt_mm_list)
+            ),
             "scalefree_err": scalefree_err,
             "scalefree_err_pct": (100.0 * scalefree_err
                                   if scalefree_defined else float("nan")),
@@ -579,6 +663,14 @@ def main(cfg: DictConfig):
             "csi005_2d_series": list(csi005_2d_list),
             "csi030_2d_series": list(csi030_2d_list),
             "rmse_over_sigma_series": list(rmse_over_sigma_list),
+            "mbe_ft6_series": list(mbe_ft6_list),
+            "mbe_m6_series": list(mbe_m6_list),
+            "mbe_gt_ft6_series": list(mbe_gt_ft6_list),
+            "mbe_gt_m6_series": list(mbe_gt_m6_list),
+            "mass_residual_ft3_series": list(mass_residual_ft3_list),
+            "mass_residual_gt_ft3_series": list(mass_residual_gt_ft3_list),
+            "abs_balance_depth_mm_series": list(balance_depth_mm_list),
+            "abs_balance_depth_gt_mm_series": list(balance_depth_gt_mm_list),
             "sd_gt_series": list(sd_gt_2d_list),
         }
 
@@ -596,8 +688,8 @@ def main(cfg: DictConfig):
         all_rmse_tensor = torch.tensor(all_rmse_all)
         overall_mean_rmse = torch.mean(all_rmse_tensor, dim=0)
         overall_std_rmse = torch.std(all_rmse_tensor, dim=0)
-        print("Overall Mean RMSE (m) over rollout steps:", overall_mean_rmse)
-        print("Overall Std RMSE (m) over rollout steps:", overall_std_rmse)
+        print("Overall Mean RMSE (ft) over rollout steps:", overall_mean_rmse)
+        print("Overall Std RMSE (ft) over rollout steps:", overall_std_rmse)
         if all_rmse_2d and all_rmse_1d and len({len(r) for r in all_rmse_2d}) == 1:
             m2 = torch.tensor(all_rmse_2d)
             m1 = torch.tensor(all_rmse_1d)
@@ -629,12 +721,37 @@ def main(cfg: DictConfig):
             "use_local_physics_loss": bool(use_local_physics_loss),
             "scalefree_tau": tau_wet,
             "n_events": len(per_hydrograph),
+            "mbe_definition": "HydroGraphNet Eq. 33 squared global continuity residual",
+            "mbe_volume_scope": "2D surface nodes",
+            "mbe_native_unit": "ft^6",
+            "mbe_si_unit": "m^6",
+            "mbe_delta_t_seconds": delta_t,
+            "mbe_source_discretization": (
+                "per-step rain depth and interval-average drainage discharge"
+            ),
+            "mbe_source_assumption": (
+                "zero unobserved infiltration and boundary surface outflow"
+            ),
         },
         "overall": {
             "rmse_2d_mean": _mean_defined("mean_rmse"),
             "nse_2d_mean": _mean_defined("mean_nse"),
             "csi_005_mean": _mean_defined("mean_csi_005"),
             "csi_030_mean": _mean_defined("mean_csi_030"),
+            "mbe_mean": _mean_defined("mean_mbe"),
+            "mbe_mean_m6": _mean_defined("mean_mbe_m6"),
+            "mbe_gt_mean": _mean_defined("mean_mbe_gt"),
+            "mbe_gt_mean_m6": _mean_defined("mean_mbe_gt_m6"),
+            "mass_residual_mean_ft3": _mean_defined("mean_mass_residual_ft3"),
+            "mass_residual_gt_mean_ft3": _mean_defined(
+                "mean_mass_residual_gt_ft3"
+            ),
+            "abs_balance_depth_mean_mm": _mean_defined(
+                "mean_abs_balance_depth_mm"
+            ),
+            "abs_balance_depth_gt_mean_mm": _mean_defined(
+                "mean_abs_balance_depth_gt_mm"
+            ),
             "scalefree_err_pct_mean": _mean_defined("scalefree_err_pct"),
             "rmse_over_sigma_mean": _mean_defined("rmse_over_sigma"),
             "n_scalefree_undefined": sum(
@@ -666,7 +783,7 @@ def main(cfg: DictConfig):
             label="± Std",
         )
         plt.xlabel("Time (Hours)", fontsize=20)
-        plt.ylabel("RMSE (m)", fontsize=20)
+        plt.ylabel("RMSE (ft)", fontsize=20)
         plt.title("Overall RMSE Curve Over Rollout", fontsize=24)
         plt.legend(fontsize=16)
         plt.grid(True)

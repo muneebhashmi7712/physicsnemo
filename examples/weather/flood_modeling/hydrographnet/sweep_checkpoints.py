@@ -58,7 +58,7 @@ def build_model(cfg, device):
 
 @torch.no_grad()
 def evaluate_rollout(model, test_dataset, cfg, device):
-    """Run full test-set rollout, return (mean_total, mean_2d, mean_1d) in metres."""
+    """Run full test-set rollout, return (mean_total, mean_2d, mean_1d) in feet."""
     rollout_length = cfg.get("num_test_time_steps", 8)
     n_time_steps = cfg.get("n_time_steps", 2)
     use_1d = cfg.get("use_1d", False)
@@ -218,8 +218,8 @@ def main(cfg: DictConfig):
             model, test_dataset, cfg, device
         )
         print(
-            f"[epoch {ep:>2d}] 2D_mean={mean_2d:.4f} m | "
-            f"1D_mean={mean_1d:.4f} m | total_mean={mean_total:.4f} m "
+            f"[epoch {ep:>2d}] 2D_mean={mean_2d:.4f} ft | "
+            f"1D_mean={mean_1d:.4f} ft | total_mean={mean_total:.4f} ft "
             f"(loaded={epoch_loaded})"
         )
         rows.append(
@@ -238,10 +238,10 @@ def main(cfg: DictConfig):
     best = min(rows, key=lambda r: r["mean_2d"])
     print(
         f"\nBest 2D epoch = {best['epoch']} "
-        f"(2D={best['mean_2d']:.4f} m | 1D={best['mean_1d']:.4f} m | "
-        f"total={best['mean_total']:.4f} m)"
+        f"(2D={best['mean_2d']:.4f} ft | 1D={best['mean_1d']:.4f} ft | "
+        f"total={best['mean_total']:.4f} ft)"
     )
-    print("Target to beat: 2D_mean <= 0.0195 m (v2-nolc baseline)")
+    print("Target to beat: 2D_mean <= 0.0195 ft (v2-nolc baseline)")
 
 
 if __name__ == "__main__":

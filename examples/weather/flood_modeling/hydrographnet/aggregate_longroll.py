@@ -154,7 +154,8 @@ def main():
                         "frozen_window": (
                             "" if rain10 is None else int(rain10 == 0.0)),
                         "rmse_2d_m": rmse,
-                        "rmse_2d_mm": rmse * 1000.0,
+                        # UrbanFlood depths are US survey FEET: mm = ft * 304.8.
+                        "rmse_2d_mm": rmse * 304.8,
                         # Metrics below are computed by inference.py over the
                         # FULL rollout only; they cannot be re-derived for a
                         # prefix, so they are blank on the common-horizon rows.

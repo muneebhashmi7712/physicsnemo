@@ -57,18 +57,18 @@ def parse_tensor_line(line: str) -> list[float]:
 def parse_event_line(line: str):
     """Parse a per-event RMSE line. Two formats exist:
 
-      Event event_42: Mean RMSE = 0.0123 m                         (legacy)
-      Event event_42: Mean RMSE = 0.0123 m | 2D = 0.0100 m | 1D = 0.0500 m
+      Event event_42: Mean RMSE = 0.0123 ft                         (legacy)
+      Event event_42: Mean RMSE = 0.0123 ft | 2D = 0.0100 ft | 1D = 0.0500 ft
 
     Returns (event_id, overall_rmse, rmse_2d_or_None, rmse_1d_or_None).
     """
-    m = re.search(r"Event\s+event_(\d+):\s+Mean\s+RMSE\s+=\s+([\d.eE+-]+)\s+m", line)
+    m = re.search(r"Event\s+event_(\d+):\s+Mean\s+RMSE\s+=\s+([\d.eE+-]+)\s+(?:ft|m)\b", line)
     if not m:
         return None
     event_id = int(m.group(1))
     overall = float(m.group(2))
-    m2d = re.search(r"\|\s*2D\s*=\s*([\d.eE+-]+)\s+m", line)
-    m1d = re.search(r"\|\s*1D\s*=\s*([\d.eE+-]+)\s+m", line)
+    m2d = re.search(r"\|\s*2D\s*=\s*([\d.eE+-]+)\s+(?:ft|m)\b", line)
+    m1d = re.search(r"\|\s*1D\s*=\s*([\d.eE+-]+)\s+(?:ft|m)\b", line)
     rmse_2d = float(m2d.group(1)) if m2d else None
     rmse_1d = float(m1d.group(1)) if m1d else None
     return event_id, overall, rmse_2d, rmse_1d
@@ -96,7 +96,11 @@ def parse_inference_out(path: str) -> dict:
                 out["step_2d_means"] = parse_tensor_line(line)
             elif "Overall Std  RMSE — 2D nodes" in line:
                 out["step_2d_stds"] = parse_tensor_line(line)
-            elif "Overall Mean RMSE (m) over rollout steps" in line:
+            # Unit-agnostic: inference.py used to print "(m)" and now prints "(ft)".
+            # Matching prefix + suffix reads both the 106 archived logs and new runs.
+            # Cannot collide with the "— 2D nodes" lines above: they carry no
+            # "over rollout steps" suffix.
+            elif "Overall Mean RMSE" in line and "over rollout steps" in line:
                 out["step_overall_means"] = parse_tensor_line(line)
             else:
                 ev = parse_event_line(line)
@@ -129,7 +133,7 @@ def load_intensity() -> dict:
 
 
 def load_static_elevation() -> dict:
-    """node_idx -> ground elevation (m), from the shared 2d_nodes_static.csv.
+    """node_idx -> ground elevation (ft), from the shared 2d_nodes_static.csv.
 
     This is the SAME column 6 ('elevation') that inference.py denormalises into
     `elev_real` and subtracts from water_level to form depth above ground
@@ -167,7 +171,7 @@ def event_max_depth(event_id: int, elevation: dict) -> float:
 def analysis_1(parsed_by_exp: dict, intensity: dict, splits_by_exp: dict):
     """Variance / significance audit (open thread 1).
 
-    (a) Decompose p1a_s1's 13 per-event 2D RMSEs — is the 0.0358 m mean driven by
+    (a) Decompose p1a_s1's 13 per-event 2D RMSEs — is the 0.0358 ft mean driven by
         one or two hard events? (leave-one-out / leave-two-out).
     (b) Re-quote the interpolation gap in 2D-only terms using a seed-robust
         per-bin-pooled-across-seeds metric, plus the gap with p1a_s1 excluded.
@@ -181,8 +185,8 @@ def analysis_1(parsed_by_exp: dict, intensity: dict, splits_by_exp: dict):
                   key=lambda r: r[1], reverse=True)
     full_mean = mean(r[1] for r in rows)
     print("## p1a_s1 per-event 2D RMSE (the outlier seed, mean = "
-          f"{full_mean:.4f} m)\n")
-    print("| event | bin | total in | 2D RMSE (m) |")
+          f"{full_mean:.4f} ft)\n")
+    print("| event | bin | total in | 2D RMSE (ft) |")
     print("|---|---|---|---|")
     for ev, r in rows:
         inches, b = intensity[ev]
@@ -190,15 +194,15 @@ def analysis_1(parsed_by_exp: dict, intensity: dict, splits_by_exp: dict):
     vals = [r[1] for r in rows]
     loo = mean(sorted(vals)[:-1])       # drop the single worst
     lto = mean(sorted(vals)[:-2])       # drop the worst two
-    print(f"\n- Full mean (13 events): **{full_mean:.4f} m**")
-    print(f"- Leave-one-out (drop event_{rows[0][0]}): **{loo:.4f} m**")
+    print(f"\n- Full mean (13 events): **{full_mean:.4f} ft**")
+    print(f"- Leave-one-out (drop event_{rows[0][0]}): **{loo:.4f} ft**")
     print(f"- Leave-two-out (drop event_{rows[0][0]}, event_{rows[1][0]}): "
-          f"**{lto:.4f} m**")
+          f"**{lto:.4f} ft**")
     other = mean([parsed_by_exp[f"p1a_{s}"]["per_event_2d"][ev]
                   for s in ("s0", "s2")
                   for ev in splits_by_exp[f"p1a_{s}"]["test_event_ids"]
                   if ev in parsed_by_exp[f"p1a_{s}"]["per_event_2d"]])
-    print(f"- Reference: pooled per-event 2D RMSE of s0+s2: **{other:.4f} m**")
+    print(f"- Reference: pooled per-event 2D RMSE of s0+s2: **{other:.4f} ft**")
 
     # ---- (b) seed-robust 2D interpolation gap -----------------------------
     # Phase 1A: pool per-event 2D RMSEs across the three stratified seeds by bin.
@@ -226,7 +230,7 @@ def analysis_1(parsed_by_exp: dict, intensity: dict, splits_by_exp: dict):
     print("\n## Seed-robust 2D interpolation gap "
           "(per-event 2D RMSE pooled across seeds)\n")
     print("The pooled metric weights every test event equally regardless of which "
-          "seed drew it, so it does NOT inherit Phase 1A's 0.0120 m seed-mean "
+          "seed drew it, so it does NOT inherit Phase 1A's 0.0120 ft seed-mean "
           "spread (which comes from which 13 events land in each stratified draw).\n")
     print("| Held-out bin | Phase 1A bin RMSE (2D) | Phase 1B bin RMSE (2D) | gap |")
     print("|---|---|---|---|")
@@ -253,9 +257,9 @@ def analysis_1(parsed_by_exp: dict, intensity: dict, splits_by_exp: dict):
         med_gap = median(p1b_vals) - median(p1a_vals)
         ta, tb = upper_trim_mean(p1a_vals), upper_trim_mean(p1b_vals)
         robust_lines.append(
-            f"- {b}\": median gap = {med_gap:+.4f} m "
+            f"- {b}\": median gap = {med_gap:+.4f} ft "
             f"(1A {median(p1a_vals):.4f} / 1B {median(p1b_vals):.4f}); "
-            f"upper-10%-trimmed mean gap = {tb - ta:+.4f} m "
+            f"upper-10%-trimmed mean gap = {tb - ta:+.4f} ft "
             f"(1A {ta:.4f} / 1B {tb:.4f})"
         )
     print("\nRobustness (symmetric — same operation on both sides of the gap):")
@@ -268,7 +272,7 @@ def analysis_1(parsed_by_exp: dict, intensity: dict, splits_by_exp: dict):
 def analysis_2(parsed_by_exp: dict, intensity: dict, splits_by_exp: dict):
     """Normalized-RMSE test (open thread 2): bracketing vs intrinsic difficulty.
 
-    normalized_rmse = per_event_2D_RMSE / per_event_max_depth. If the ~0.012 m
+    normalized_rmse = per_event_2D_RMSE / per_event_max_depth. If the ~0.012 ft
     absolute gap between the 2-4" and 4-6" holdouts closes under normalization,
     the 'small-storm events are intrinsically harder targets' story wins over the
     'bracketing symmetry' story.
@@ -299,7 +303,7 @@ def analysis_2(parsed_by_exp: dict, intensity: dict, splits_by_exp: dict):
         bins[b] = rows
         print(f"## Holdout {b}\" — per held-out event "
               f"(2D RMSE = mean across 3 seeds)\n")
-        print("| event | total in | 2D RMSE (m) | max depth (m) | norm RMSE |")
+        print("| event | total in | 2D RMSE (ft) | max depth (ft) | norm RMSE |")
         print("|---|---|---|---|---|")
         for ev, rmse_2d, md, nrm in sorted(rows, key=lambda r: r[0]):
             print(f"| event_{ev} | {intensity[ev][0]:.2f} | {rmse_2d:.4f} | "
@@ -307,7 +311,7 @@ def analysis_2(parsed_by_exp: dict, intensity: dict, splits_by_exp: dict):
         print()
 
     print("## Summary — does the gap close under normalization?\n")
-    print("| Holdout bin | mean 2D RMSE (m) | mean max depth (m) | mean norm RMSE |")
+    print("| Holdout bin | mean 2D RMSE (ft) | mean max depth (ft) | mean norm RMSE |")
     print("|---|---|---|---|")
     summary = {}
     for b in ("4-6", "2-4"):
@@ -322,7 +326,7 @@ def analysis_2(parsed_by_exp: dict, intensity: dict, splits_by_exp: dict):
     nrm_gap = summary["2-4"][2] - summary["4-6"][2]
     abs_ratio = summary["2-4"][0] / summary["4-6"][0]
     nrm_ratio = summary["2-4"][2] / summary["4-6"][2]
-    print(f"\n- Absolute gap (2-4\" − 4-6\"): **{abs_gap:+.4f} m** "
+    print(f"\n- Absolute gap (2-4\" − 4-6\"): **{abs_gap:+.4f} ft** "
           f"({abs_ratio:.2f}× harder)")
     print(f"- Normalized gap (2-4\" − 4-6\"): **{nrm_gap:+.4f}** "
           f"({nrm_ratio:.2f}× harder)")
@@ -398,7 +402,7 @@ def main():
         print("Headline = mean across the 8 rollout steps (5..40 min) of "
               "`Overall Mean RMSE — 2D nodes`.")
         print()
-        print("| Exp | mode | holdout bin | n_test | 2D mean RMSE (m) | step-8 2D RMSE (m) |")
+        print("| Exp | mode | holdout bin | n_test | 2D mean RMSE (ft) | step-8 2D RMSE (ft) |")
         print("|---|---|---|---|---|---|")
         for row in all_rows:
             print(f"| {row['exp']} | {row['mode']} | "
@@ -410,7 +414,7 @@ def main():
         print()
         print("## Per-sub-experiment mean ± std across 3 seeds")
         print()
-        print("| Sub-exp | 2D mean RMSE (m) | step-8 2D RMSE (m) |")
+        print("| Sub-exp | 2D mean RMSE (ft) | step-8 2D RMSE (ft) |")
         print("|---|---|---|")
         for prefix, label in (("p1a_", "Phase 1A — stratified 80/20"),
                               ("p1b_h46_", "Phase 1B-1 — holdout 4-6\""),
@@ -441,7 +445,7 @@ def main():
         for exp in ("p1a_s0", "p1a_s1", "p1a_s2"):
             for b, (rmse, n) in summary[exp]["per_bin_overall"].items():
                 p1a_bin_to_rmses[b].extend([rmse] * n)
-        print("| Bin | n events (pooled across 3 seeds) | mean overall RMSE (m) |")
+        print("| Bin | n events (pooled across 3 seeds) | mean overall RMSE (ft) |")
         print("|---|---|---|")
         for b in ("0-2", "2-4", "4-6", "6-8", "8-10"):
             if b in p1a_bin_to_rmses:

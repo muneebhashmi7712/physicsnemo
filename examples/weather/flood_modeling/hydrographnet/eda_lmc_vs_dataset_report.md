@@ -6,7 +6,7 @@
 >
 > A City-2 (Model_2) experiment run after this report **flipped the result**:
 > on Model_2's richly-coupled graph (197 connections vs Model_1's 17), **LMC
-> *helps* by −6.2%** (2D 0.0140 m vs no-LMC 0.0149 m) — a near-mirror-image
+> *helps* by −6.2%** (2D 0.0140 ft vs no-LMC 0.0149 ft) — a near-mirror-image
 > of Model_1's +6.2% penalty. Crucially, Model_2's loss-direction correlation
 > is **r = +0.989** — i.e. the diagnostic in this report's headline finding
 > *correctly predicts* the flip.
@@ -27,9 +27,9 @@ The same `compute_local_conservation_loss` function ([utils.py:156-314](utils.py
 | Dataset | Best LMC vs no-LMC | Verdict |
 |---|---|---|
 | HydroGraphNet (White River, KNN k=4, pure 2D) | **−15% to −22% RMSE** | LMC clearly helps |
-| UrbanFlood Model_1 (physical mesh + 1D drainage + 2D-1D coupling) | **+6% RMSE** (best LMC 0.0207 m vs no-LMC 0.0195 m) | LMC actively hurts |
+| UrbanFlood Model_1 (physical mesh + 1D drainage + 2D-1D coupling) | **+6% RMSE** (best LMC 0.0207 ft vs no-LMC 0.0195 ft) | LMC actively hurts |
 
-Same formula. Same hyper-parameter family (smooth-L1 β=0.1, warmup 5 ep, λ ≈ 0.03–0.05). After exhausting every loss-side knob and training-regime variation (v3-v7), the +0.0012 m gap on UrbanFlood persisted. This EDA isolates the structural cause.
+Same formula. Same hyper-parameter family (smooth-L1 β=0.1, warmup 5 ep, λ ≈ 0.03–0.05). After exhausting every loss-side knob and training-regime variation (v3-v7), the +0.0012 ft gap on UrbanFlood persisted. This EDA isolates the structural cause.
 
 ## Headline finding — the LMC and prediction-MSE losses are pulling in opposite directions on UrbanFlood
 
@@ -104,7 +104,7 @@ Paths forward, in corrected order of evidence strength:
    - **Concat-trick edge decoder** (DUALFloodGNN-style endpoint concat — tested with antisym in v4 Exp 4 and regressed, but not in isolation),
    - **Antisym alone** (LMC residual built from forward edges only — never tested without concat).
 
-3. **Drop the 1D drainage from the LMC residual at training time but keep it as input features.** This was Exp 8 (restrict_to_2d) and regressed by +0.0018 m — but the regression was attributed to "losing an implicit 1D-side stabiliser." Re-reading that result in light of this EDA: the stabiliser may have been a side-effect of the loss-mean dilution, not a feature. Combined with FiLM at the connection edges, this becomes worth a second pass.
+3. **Drop the 1D drainage from the LMC residual at training time but keep it as input features.** This was Exp 8 (restrict_to_2d) and regressed by +0.0018 ft — but the regression was attributed to "losing an implicit 1D-side stabiliser." Re-reading that result in light of this EDA: the stabiliser may have been a side-effect of the loss-mean dilution, not a feature. Combined with FiLM at the connection edges, this becomes worth a second pass.
 
 ## How to reproduce
 

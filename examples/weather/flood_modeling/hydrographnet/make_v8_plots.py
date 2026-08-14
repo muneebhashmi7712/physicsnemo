@@ -42,7 +42,7 @@ import aggregate_v8_results as agg
 PLOTS_DIR = os.path.join(agg.OUTPUTS_ROOT, "plots")
 V8_RESULTS_CSV = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                               "v8_results.csv")
-V2_NOLC_REF = 0.0195  # full-pool v2-nolc 2D RMSE reference (m)
+V2_NOLC_REF = 0.0195  # full-pool v2-nolc 2D RMSE reference (ft)
 
 # Sub-experiment grouping: prefix -> (label, color, linestyle, marker).
 SUBEXP = {
@@ -60,14 +60,14 @@ BIN_EDGES = [0, 2, 4, 6, 8, 10]
 
 # Per-event 2D-only RMSE parser (aggregator only captures the overall value).
 _EVENT_2D_RE = re.compile(
-    r"Event\s+event_(\d+):.*?\|\s*2D\s*=\s*([\d.eE+-]+)\s+m")
+    r"Event\s+event_(\d+):.*?\|\s*2D\s*=\s*([\d.eE+-]+)\s+(?:ft|m)\b")
 
 
 # ----------------------------------------------------------------------------
 # Parsing / data assembly
 # ----------------------------------------------------------------------------
 def parse_event_2d(path: str) -> dict:
-    """Return {event_id: 2D-only RMSE (m)} parsed from an inference .out log."""
+    """Return {event_id: 2D-only RMSE (ft)} parsed from an inference .out log."""
     out = {}
     with open(path) as f:
         for line in f:
@@ -168,13 +168,13 @@ def fig_rollout_curves(step_rows):
                       marker=SUBEXP[p]["marker"], lw=1.8, label=SUBEXP[p]["label"])
                for p in SUBEXP_ORDER]
     handles.append(Line2D([0], [0], color="black", ls="-.", lw=1.4,
-                          label=f"v2-nolc full-pool ref = {V2_NOLC_REF:.4f} m"))
+                          label=f"v2-nolc full-pool ref = {V2_NOLC_REF:.4f} ft"))
     ax.legend(handles=handles, loc="upper left", framealpha=0.9)
 
     ax.set_xticks(steps)
     ax.set_xticklabels([f"{i}\n(t+{5*i}min)" for i in steps])
     ax.set_xlabel("Rollout step")
-    ax.set_ylabel("2D RMSE (m)")
+    ax.set_ylabel("2D RMSE (ft)")
     ax.set_title("Per-step 2D RMSE over the 8-step rollout (all 9 runs)")
     ax.set_ylim(bottom=0)
     save(fig, "rollout_curves")
@@ -221,20 +221,20 @@ def fig_interpolation_gap(per_event):
 
         bar_tops.append((i, max(a_val, b_val + b_std), gap, pct))
         print(f"| {b}\" | {a_val:.4f} | {b_val:.4f} ± {b_std:.4f} | "
-              f"{gap:+.4f} m ({pct:+.1f}%) |")
+              f"{gap:+.4f} ft ({pct:+.1f}%) |")
 
     # Headroom first, then place each gap label a fixed clearance above its bars.
     ymax = max(t for _, t, _, _ in bar_tops)
     ax.set_ylim(0, ymax * 1.32)
     for i, top, gap, pct in bar_tops:
-        ax.annotate(f"gap {gap:+.4f} m ({pct:+.1f}%)",
+        ax.annotate(f"gap {gap:+.4f} ft ({pct:+.1f}%)",
                     xy=(i, top), xytext=(i, top + 0.04 * ymax),
                     ha="center", va="bottom", fontsize=11, fontweight="bold")
 
     ax.set_xticks(list(xs))
     ax.set_xticklabels([f"{b}\" held out" for b, _ in groups])
     ax.set_xlabel("Held-out rainfall-intensity bin")
-    ax.set_ylabel("2D RMSE (m)")
+    ax.set_ylabel("2D RMSE (ft)")
     ax.set_title("Interpolation gap: held-out bin vs.\nsame bin under stratified split",
                  fontsize=13)
     ax.legend(loc="upper left", framealpha=0.9)
@@ -271,7 +271,7 @@ def fig_per_event_vs_intensity(per_event):
     ax.legend(handles=band_handles, loc="upper right", framealpha=0.9)
 
     ax.set_xlabel("Total event rainfall (inches)")
-    ax.set_ylabel("Per-event 2D RMSE (m)")
+    ax.set_ylabel("Per-event 2D RMSE (ft)")
     ax.set_title("Per-event 2D RMSE vs rainfall intensity")
     ax.set_ylim(bottom=0)
     save(fig, "per_event_rmse_vs_intensity")
@@ -367,7 +367,7 @@ def fig_p1a_seed_comparison(per_event):
     ax.set_xticks(list(x))
     ax.set_xticklabels([f"{b}\"" for b in bins])
     ax.set_xlabel("Rainfall-intensity bin")
-    ax.set_ylabel("Phase 1A per-event 2D RMSE (m)")
+    ax.set_ylabel("Phase 1A per-event 2D RMSE (ft)")
     ax.set_title("Phase 1A per-bin 2D RMSE by seed "
                  "(seed s1 draws an unusually hard test set)")
     ax.legend(loc="upper left", framealpha=0.9)

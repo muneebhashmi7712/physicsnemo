@@ -164,13 +164,13 @@ def compute_local_conservation_loss(
     Compute per-node local mass conservation loss (adapted from DualFloodGNN Eq. 18).
 
     Reconstructs absolute flow Q = Q_prev + delta_Q_pred, denormalises both
-    predicted volume changes and edge flows to physical units (m³ per step),
+    predicted volume changes and edge flows to physical units (ft³ per step),
     forms the residual ΔV − (net_flow + S_gt) in physical units, and divides
     by the per-node volume std so each node-type contributes a comparable
     magnitude regardless of its absolute volume scale.
 
     v2 (1D-coupling): when the dataset stores per-type stats, the graph
-    carries `V_std_per_node` and `Q_sigma_per_edge_phys` (both in m³); for
+    carries `V_std_per_node` and `Q_sigma_per_edge_phys` (both in ft³); for
     the legacy 2D-only path these tensors collapse to a single shared std
     so the loss reduces to the v1/v5 formulation bit-identically.
 
@@ -205,13 +205,13 @@ def compute_local_conservation_loss(
     device = node_pred.device
     num_nodes = node_pred.shape[0]
 
-    V_std_per_node     = graph.V_std_per_node.to(device)              # [N], m³
-    Q_sigma_per_edge   = graph.Q_sigma_per_edge_phys.to(device)       # [E], m³
+    V_std_per_node     = graph.V_std_per_node.to(device)              # [N], ft³
+    Q_sigma_per_edge   = graph.Q_sigma_per_edge_phys.to(device)       # [E], ft³
 
-    # ΔV in physical m³.
+    # ΔV in physical ft³.
     delta_V_phys = node_pred[:, 1] * V_std_per_node
 
-    # Q in physical m³/step. edge_q_prev / edge_pred are normalised by the
+    # Q in physical ft³/step. edge_q_prev / edge_pred are normalised by the
     # per-edge sigma which already includes delta_t.
     #
     # Use model-predicted ΔQ for 2D and 1D edges, but substitute GT ΔQ
@@ -269,7 +269,7 @@ def compute_local_conservation_loss(
     # S_gt was stored as S_phys / V_std_per_node (dimensionless).
     S_phys = graph.source_term.to(device) * V_std_per_node
 
-    residual_phys = delta_V_phys - (net_flow_phys + S_phys)            # m³
+    residual_phys = delta_V_phys - (net_flow_phys + S_phys)            # ft³
     residual_norm = residual_phys / V_std_per_node                     # dimensionless
 
     keep = torch.ones(num_nodes, dtype=torch.bool, device=device)
@@ -314,108 +314,6 @@ def compute_local_conservation_loss(
     return per_node.mean()
 
 
-def compute_steady_state_conservation_loss(
-    node_pred, edge_pred, graph,
-    smooth_l1_beta: float = 0.0,
-    apply_boundary_mask: bool = False,
-    restrict_to_2d: bool = False,
-    node_type_weighting: str = "none",
-):
-    """Steady-state mass-conservation loss for the v9 time-less regime.
-
-    Sibling of :func:`compute_local_conservation_loss`, but with the time
-    derivative dropped. At the storm peak dV/dt≈0, so local continuity reduces
-    to ``net_flow + S = 0`` (net edge inflow balances the rainfall source).
-    The edge decoder predicts the steady flow Q directly: the dataset sets
-    ``edge_q_prev = 0`` so ``Q_pred = edge_pred * Q_sigma_per_edge``. The
-    scatter/aggregation, boundary/2D masking, per-type weighting and reduction
-    are identical to the autoregressive loss; only the residual changes from
-    ``ΔV − (net_flow + S)`` to ``net_flow + S``.
-
-    L_steady = mean_i | (net_flow_phys_i + S_phys_i) / V_std_per_node_i |
-
-    Args:
-        node_pred (torch.Tensor): Node predictions [N, 1] (peak depth). Used
-            only for device/dtype; it carries no volume channel here.
-        edge_pred (torch.Tensor): Edge predictions [E, 1] (steady Q normalised
-            per edge by ``Q_sigma_per_edge_phys``).
-        graph (PyGData): carries edge_index, edge_q_prev (=0), source_term,
-            V_std_per_node, Q_sigma_per_edge_phys; optionally boundary_mask,
-            node_type, is_forward_edge.
-        smooth_l1_beta, apply_boundary_mask, restrict_to_2d, node_type_weighting:
-            same semantics as :func:`compute_local_conservation_loss`.
-
-    Returns:
-        torch.Tensor: Scalar steady-state conservation loss.
-    """
-    device = node_pred.device
-    num_nodes = node_pred.shape[0]
-
-    V_std_per_node = graph.V_std_per_node.to(device)              # [N], m³
-    Q_sigma_per_edge = graph.Q_sigma_per_edge_phys.to(device)     # [E], m³
-
-    # Steady flow in physical m³/step (edge_q_prev is 0 in static mode).
-    Q_pred_phys = (graph.edge_q_prev.to(device) + edge_pred.squeeze(-1)) * Q_sigma_per_edge
-
-    edge_index = graph.edge_index  # [2, E]
-    Q_in_phys = torch.zeros(num_nodes, device=device, dtype=Q_pred_phys.dtype)
-    Q_out_phys = torch.zeros(num_nodes, device=device, dtype=Q_pred_phys.dtype)
-
-    if hasattr(graph, "is_forward_edge") and graph.is_forward_edge is not None:
-        fwd = graph.is_forward_edge.to(device).bool()
-        Q_fwd = Q_pred_phys[fwd]
-        src_fwd = edge_index[0][fwd]
-        dst_fwd = edge_index[1][fwd]
-        Q_in_phys.scatter_add_(0, dst_fwd, Q_fwd)
-        Q_out_phys.scatter_add_(0, src_fwd, Q_fwd)
-        net_flow_phys = Q_in_phys - Q_out_phys
-    else:
-        Q_in_phys.scatter_add_(0, edge_index[1], Q_pred_phys)
-        Q_out_phys.scatter_add_(0, edge_index[0], Q_pred_phys)
-        net_flow_phys = (Q_in_phys - Q_out_phys) / 2.0
-
-    # S_gt stored as S_phys / V_std_per_node (dimensionless).
-    S_phys = graph.source_term.to(device) * V_std_per_node
-
-    residual_phys = net_flow_phys + S_phys                        # m³/step
-    residual_norm = residual_phys / V_std_per_node                # dimensionless
-
-    keep = torch.ones(num_nodes, dtype=torch.bool, device=device)
-    if apply_boundary_mask and hasattr(graph, "boundary_mask") and graph.boundary_mask is not None:
-        keep &= ~graph.boundary_mask.to(device).bool()
-    if restrict_to_2d and hasattr(graph, "node_type") and graph.node_type is not None:
-        keep &= (graph.node_type.to(device) == 0)
-
-    residual_kept = residual_norm[keep]
-    if residual_kept.numel() == 0:
-        return torch.zeros((), device=device, dtype=node_pred.dtype)
-
-    weights = None
-    if (
-        node_type_weighting == "per_type"
-        and hasattr(graph, "node_type")
-        and graph.node_type is not None
-        and not restrict_to_2d
-    ):
-        nt_kept = graph.node_type.to(device)[keep]
-        n_2d = (nt_kept == 0).sum().clamp(min=1)
-        n_1d = (nt_kept == 1).sum().clamp(min=1)
-        if n_1d > 0:
-            w_1d = n_2d.to(node_pred.dtype) / n_1d.to(node_pred.dtype)
-            weights = torch.ones_like(residual_kept)
-            weights[nt_kept == 1] = w_1d
-
-    if smooth_l1_beta > 0.0:
-        target = torch.zeros_like(residual_kept)
-        per_node = F.smooth_l1_loss(
-            residual_kept, target, beta=smooth_l1_beta, reduction="none"
-        )
-    else:
-        per_node = residual_kept.abs()
-
-    if weights is not None:
-        return (weights * per_node).sum() / weights.sum()
-    return per_node.mean()
 
 
 def custom_loss(pred, targets):

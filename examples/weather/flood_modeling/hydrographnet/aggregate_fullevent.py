@@ -441,7 +441,7 @@ def _write_trends(path, summary, per_event_rows, H_common, rain_cache):
 
     # Q1 — onset-aligned
     lines.append("\n## Q1 — RMSE for each UNSEEN bin (onset-aligned, no-LMC arm)\n")
-    lines.append("| model | bin | n | RMSE nolc (m) | NSE nolc | scalefree% | CSI0.05 |")
+    lines.append("| model | bin | n | RMSE nolc (ft) | NSE nolc | scalefree% | CSI0.05 |")
     lines.append("|---|---|---|---|---|---|---|")
     for s in ons:
         lines.append(f"| {s['model']} | {s['holdout_bin']} | {s['n_events']} | "

@@ -54,7 +54,8 @@ def parse_infer_2d(path):
     # fallback: overall (no 2D breakdown in very old files)
     with open(path) as f:
         for line in f:
-            if "Overall Mean RMSE (m) over rollout steps" in line:
+            # Unit-agnostic: matches both the archived "(m)" logs and new "(ft)" ones.
+            if "Overall Mean RMSE" in line and "over rollout steps" in line:
                 m = bracket_re.search(line)
                 if m:
                     return [float(x) for x in re.findall(r"[\d.]+(?:e[+-]?\d+)?", m.group(1))]
@@ -124,7 +125,7 @@ def save(fig, name):
 # FIG 1 — Rollout curves: ALL Model_1 experiments (one panel)
 # ─────────────────────────────────────────────────────────────────────────────
 fig, ax = plt.subplots(figsize=(10, 6))
-ax.axhline(0.0195, color="black", lw=1.5, ls="--", label="v2-nolc target 0.0195 m")
+ax.axhline(0.0195, color="black", lw=1.5, ls="--", label="v2-nolc target 0.0195 ft")
 
 for label, (d, infer_f, color, ls, group, has_lmc) in EXPS.items():
     if "city2" in d or label == BASELINE_LABEL:
@@ -140,7 +141,7 @@ if BASELINE_LABEL in rmse_data:
             marker="o", ms=5, label="v2-nolc (baseline)")
 
 ax.set_xlabel("Rollout step", fontsize=12)
-ax.set_ylabel("2D RMSE (m)", fontsize=12)
+ax.set_ylabel("2D RMSE (ft)", fontsize=12)
 ax.set_title("Model_1: 2D rollout RMSE across all LMC experiments", fontsize=13)
 ax.legend(fontsize=7.5, ncol=3, loc="upper left")
 ax.set_xticks(STEPS)
@@ -174,7 +175,7 @@ for idx, (title, groups) in enumerate(GROUP_DEFS):
                 marker="o", ms=4, label=label.replace("\n", " "))
     ax.set_title(title, fontsize=10)
     ax.set_xlabel("Rollout step", fontsize=9)
-    ax.set_ylabel("2D RMSE (m)", fontsize=9)
+    ax.set_ylabel("2D RMSE (ft)", fontsize=9)
     ax.legend(fontsize=8, loc="upper left")
     ax.set_xticks(STEPS)
     ax.grid(True, alpha=0.3)
@@ -188,7 +189,7 @@ for label, (d, infer_f, color, ls, group, has_lmc) in EXPS.items():
             marker="o", ms=4, label=label.replace("\n", " "))
 ax.set_title("City-2 (Model_2): LMC flips sign", fontsize=10)
 ax.set_xlabel("Rollout step", fontsize=9)
-ax.set_ylabel("2D RMSE (m)", fontsize=9)
+ax.set_ylabel("2D RMSE (ft)", fontsize=9)
 ax.legend(fontsize=8, loc="upper left")
 ax.set_xticks(STEPS)
 ax.grid(True, alpha=0.3)
@@ -319,7 +320,7 @@ for label in ordered_labels:
 fig, ax = plt.subplots(figsize=(14, 5))
 x = np.arange(len(bar_labels))
 bars = ax.bar(x, bar_vals, color=bar_colors, edgecolor="white", linewidth=0.8, width=0.65)
-ax.axhline(0.0195, color="black", lw=1.8, ls="--", label="v2-nolc target 0.0195 m", zorder=5)
+ax.axhline(0.0195, color="black", lw=1.8, ls="--", label="v2-nolc target 0.0195 ft", zorder=5)
 
 for bar, val in zip(bars, bar_vals):
     ax.text(bar.get_x() + bar.get_width()/2, val + 0.0003,
@@ -327,7 +328,7 @@ for bar, val in zip(bars, bar_vals):
 
 ax.set_xticks(x)
 ax.set_xticklabels(bar_labels, fontsize=8)
-ax.set_ylabel("Mean 2D RMSE — 8-step rollout (m)", fontsize=10)
+ax.set_ylabel("Mean 2D RMSE — 8-step rollout (ft)", fontsize=10)
 ax.set_title("Model_1: Final 2D RMSE across all experiments (lower = better)", fontsize=12)
 ax.legend(fontsize=9)
 ax.set_ylim(0.015, 0.032)
@@ -357,21 +358,22 @@ for lbl, color, ls, marker in [
                 label=lbl.replace("\n", " "))
 
 ax.set_xlabel("Rollout step", fontsize=11)
-ax.set_ylabel("2D RMSE (m)", fontsize=11)
+ax.set_ylabel("2D RMSE (ft)", fontsize=11)
 ax.set_title("Model_1 vs Model_2: LMC sign flips\nwith coupling density", fontsize=11)
 ax.legend(fontsize=8)
 ax.set_xticks(STEPS)
 ax.grid(True, alpha=0.3)
 
 # Right: LMC benefit (nolc - lmc) per step for both cities
+# NOTE: UrbanFlood depths are US survey FEET -> mm = ft * 304.8 (not * 1000).
 ax = axes[1]
 if city2_nolc_label in rmse_data and city2_lmc_label in rmse_data:
     c2_benefit = np.array(rmse_data[city2_nolc_label]) - np.array(rmse_data[city2_lmc_label])
-    ax.plot(STEPS, c2_benefit*1000, color="#1abc9c", lw=2, marker="o", ms=5,
+    ax.plot(STEPS, c2_benefit*304.8, color="#1abc9c", lw=2, marker="o", ms=5,
             label="City-2: nolc − lmc (positive = LMC helps)")
 if city1_nolc_label in rmse_data and city1_lmc_label in rmse_data:
     c1_benefit = np.array(rmse_data[city1_nolc_label]) - np.array(rmse_data[city1_lmc_label])
-    ax.plot(STEPS, c1_benefit*1000, color="#2980b9", lw=2, marker="s", ms=5, ls="--",
+    ax.plot(STEPS, c1_benefit*304.8, color="#2980b9", lw=2, marker="s", ms=5, ls="--",
             label="City-1: nolc − lmc (negative = LMC hurts)")
 
 ax.axhline(0, color="black", lw=1, ls=":")
@@ -531,21 +533,21 @@ print("="*70)
 if "GT conn ΔQ\n(Exp1, 0.0207)" in rmse_data and BASELINE_LABEL in rmse_data:
     exp1 = np.array(rmse_data["GT conn ΔQ\n(Exp1, 0.0207)"])
     base = np.array(rmse_data[BASELINE_LABEL])
-    gap_s1 = (exp1[0] - base[0]) * 1000
-    gap_s8 = (exp1[7] - base[7]) * 1000
+    gap_s1 = (exp1[0] - base[0]) * 304.8
+    gap_s8 = (exp1[7] - base[7]) * 304.8
     print(f"  Exp1 vs baseline gap: step1={gap_s1:+.1f}mm, step8={gap_s8:+.1f}mm  (gap GROWS with rollout)")
 
 if "City-2 LMC\n(0.0140)" in rmse_data and "City-2 nolc\n(0.0149)" in rmse_data:
     c2l = np.array(rmse_data["City-2 LMC\n(0.0140)"])
     c2n = np.array(rmse_data["City-2 nolc\n(0.0149)"])
-    diffs = (c2n - c2l) * 1000
+    diffs = (c2n - c2l) * 304.8
     print(f"  City-2 LMC benefit by step: {[f'{d:+.1f}' for d in diffs]}")
     print(f"    → Benefit accumulates: step1={diffs[0]:+.1f}mm → step8={diffs[7]:+.1f}mm")
 
 if "Multi-step LMC\n(Exp5, 0.0249)" in rmse_data and "Multi-step nolc\n(Exp6, 0.0269)" in rmse_data:
     ml = np.mean(rmse_data["Multi-step LMC\n(Exp5, 0.0249)"])
     mn = np.mean(rmse_data["Multi-step nolc\n(Exp6, 0.0269)"])
-    print(f"  Multi-step: LMC={ml:.4f}, nolc={mn:.4f}  → LMC wins by {(mn-ml)*1000:.1f}mm in multi-step world")
+    print(f"  Multi-step: LMC={ml:.4f}, nolc={mn:.4f}  → LMC wins by {(mn-ml)*304.8:.1f}mm in multi-step world")
     b = np.mean(rmse_data[BASELINE_LABEL])
     print(f"    But single-step nolc={b:.4f} still beats both!")
 

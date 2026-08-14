@@ -101,12 +101,12 @@ def parse_tensor_line(line: str) -> list:
 
 
 def parse_event_line(line: str):
-    m = re.search(r"Event\s+event_(\d+):\s+Mean\s+RMSE\s+=\s+([\d.eE+-]+)\s+m", line)
+    m = re.search(r"Event\s+event_(\d+):\s+Mean\s+RMSE\s+=\s+([\d.eE+-]+)\s+(?:ft|m)\b", line)
     if not m:
         return None
     event_id, overall = int(m.group(1)), float(m.group(2))
-    m2d = re.search(r"\|\s*2D\s*=\s*([\d.eE+-]+)\s+m", line)
-    m1d = re.search(r"\|\s*1D\s*=\s*([\d.eE+-]+)\s+m", line)
+    m2d = re.search(r"\|\s*2D\s*=\s*([\d.eE+-]+)\s+(?:ft|m)\b", line)
+    m1d = re.search(r"\|\s*1D\s*=\s*([\d.eE+-]+)\s+(?:ft|m)\b", line)
     return event_id, overall, (float(m2d.group(1)) if m2d else None), (float(m1d.group(1)) if m1d else None)
 
 
@@ -278,8 +278,8 @@ def main():
     # Table 1: per-experiment headline 2D RMSE
     # -----------------------------------------------------------------------
     print("# UrbanFlood v8 Extension — Headline 2D RMSE per experiment\n")
-    print("Mean over 8 rollout steps of `Overall Mean RMSE — 2D nodes` (m).\n")
-    print("| Exp | Model | LMC | Split | n_test | 2D mean RMSE (m) |")
+    print("Mean over 8 rollout steps of `Overall Mean RMSE — 2D nodes` (ft).\n")
+    print("| Exp | Model | LMC | Split | n_test | 2D mean RMSE (ft) |")
     print("|---|---|---|---|---|---|")
     for exp in EXT_EXP_NAMES:
         meta = _cell_meta(exp)
@@ -334,7 +334,7 @@ def main():
             if g is None:
                 row += " — |"
             else:
-                row += (f" {g['gap']:+.4f} m ({g['gap_pct']:+.1f}%) |")
+                row += (f" {g['gap']:+.4f} ft ({g['gap_pct']:+.1f}%) |")
         print(row)
 
     # Raw numbers for the gap table.
@@ -361,9 +361,9 @@ def main():
         g_m1_lmc  = gaps_by_cell.get("Model_1/lmc",  {}).get(b)
         g_m2_nolc = gaps_by_cell.get("Model_2/nolc", {}).get(b)
         g_m2_lmc  = gaps_by_cell.get("Model_2/lmc",  {}).get(b)
-        m1 = (f"{g_m1_lmc['gap']-g_m1_nolc['gap']:+.4f} m"
+        m1 = (f"{g_m1_lmc['gap']-g_m1_nolc['gap']:+.4f} ft"
               if (g_m1_nolc and g_m1_lmc) else "—")
-        m2 = (f"{g_m2_lmc['gap']-g_m2_nolc['gap']:+.4f} m"
+        m2 = (f"{g_m2_lmc['gap']-g_m2_nolc['gap']:+.4f} ft"
               if (g_m2_nolc and g_m2_lmc) else "—")
         print(f"| {b}\" | {m1} | {m2} |")
 
@@ -436,7 +436,7 @@ def _make_plots(cells, cell_data, gaps_by_cell):
 
     ax.set_xticks(x)
     ax.set_xticklabels([s for _, s in SPLIT_KEYS])
-    ax.set_ylabel("Mean 2D RMSE (m)")
+    ax.set_ylabel("Mean 2D RMSE (ft)")
     ax.set_title("v8 Extension — 2D RMSE by split type and cell")
     ax.legend(loc="upper left", fontsize=8)
     ax.set_ylim(bottom=0)
@@ -489,7 +489,7 @@ def _make_plots(cells, cell_data, gaps_by_cell):
         bars = ax.bar(cities, delta_gaps, color=city_colors)
         ax.axhline(0, color="black", linewidth=0.8, linestyle="--")
         ax.set_title(f"Δ gap (lmc − nolc) — holdout {b}\"")
-        ax.set_ylabel("Δ interpolation gap (m)\n[negative = LMC shrinks gap]")
+        ax.set_ylabel("Δ interpolation gap (ft)\n[negative = LMC shrinks gap]")
         for bar, val in zip(bars, delta_gaps):
             ax.text(bar.get_x() + bar.get_width() / 2,
                     bar.get_height() + (0.0005 if val >= 0 else -0.002),

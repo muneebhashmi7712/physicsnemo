@@ -51,7 +51,6 @@ from utils import (
     compute_physics_loss,
     compute_local_conservation_loss,
     compute_edge_flow_loss,
-    compute_steady_state_conservation_loss,
 )
 
 
@@ -100,8 +99,6 @@ class MGNTrainer:
 
         # 1D coupling toggle.
         self.use_1d = cfg.get("use_1d", False)
-        # v9: time-less peak-depth prediction (single forward pass, no rollout).
-        self.static_prediction = bool(cfg.get("static_prediction", False))
         self.n_time_steps = cfg.n_time_steps
         # The dynamic block in graph.x has 2 * window_size columns (one half
         # water_depth, the other volume). With pushforward noise the dataset
@@ -148,7 +145,6 @@ class MGNTrainer:
             edge_q_prev_as_input=bool(cfg.get("edge_q_prev_as_input", False)),
             lmc_antisymmetric=bool(cfg.get("lmc_antisymmetric", False)),
             train_rollout_length=self.train_rollout_length,
-            static_prediction=self.static_prediction,
         )
         sampler = DistributedSampler(
             dataset,
@@ -415,37 +411,7 @@ class MGNTrainer:
                 )
         return loss_total, loss_dict
 
-    def _forward_static(self, graph, physics_data):
-        """v9 time-less peak-depth training: one forward pass per event.
-
-        Loss = MSE(peak depth) + optional steady-state mass-conservation
-        regularizer. No rollout, no edge supervision (no GT ΔQ at the peak —
-        the edge head is trained purely through the conservation residual).
-        """
-        with autocast(device_type=self.dist.device.type, enabled=self.amp):
-            node_pred, edge_pred = self._call_model(
-                graph.x, graph.edge_attr, graph
-            )
-            mse_loss = self.criterion(node_pred, graph.y)
-            loss = mse_loss
-            loss_dict = {"total_loss": loss, "mse_loss": mse_loss}
-            if self.use_local_physics_loss and edge_pred is not None:
-                lmc_loss = compute_steady_state_conservation_loss(
-                    node_pred, edge_pred, graph,
-                    smooth_l1_beta=self.local_loss_smooth_l1_beta,
-                    apply_boundary_mask=self.lc_apply_boundary_mask,
-                    restrict_to_2d=self.lc_restrict_to_2d,
-                    node_type_weighting=self.lc_node_type_weighting,
-                )
-                loss = loss + self.lc_eff_weight * lmc_loss
-                loss_dict["local_physics_loss"] = lmc_loss
-                loss_dict["total_loss"] = loss
-        return loss, loss_dict
-
     def forward(self, graph, physics_data):
-        # v9: time-less peak-depth prediction (single forward pass).
-        if self.static_prediction:
-            return self._forward_static(graph, physics_data)
         # Multi-step rollout training (LMC bundle v5 / DUALFloodGNN regime).
         # When the curriculum schedule has any O > 1, the dataset provides
         # stacked GT targets for O consecutive future steps and the trainer

@@ -60,15 +60,6 @@ compute_boundary_mask: false         # convex hull mask on 2D xy_coords
 mask_inlets_in_lc: false             # OR the 2D-side inlet nodes into the boundary mask
 restrict_lc_to_2d: false             # H2: drop 1D nodes from the LMC residual
 
-# v9: time-less peak-depth prediction ("neural flood emulator"). When true,
-# each event is a single graph (one forward pass, no rollout/time window).
-# Node input = static features + a per-event total-rainfall scalar; target =
-# per-node peak depth above ground; num_output_features must be 1 and
-# num_input_features set to the static width + 1 (10 for 2D-only, 14 for
-# use_1d). LMC, if on, uses the steady-state continuity variant. Defaults
-# to false so all autoregressive runs reproduce byte-for-byte.
-static_prediction: false
-
 # 1D drainage system + 1D-2D coupling (Phase 2).
 # When true, num_input_features must be set to 20 (12 base + 4 extras +
 # 2*n_time_steps dynamic) and num_edge_features to 10 (3 shared + 4 1D-specific
