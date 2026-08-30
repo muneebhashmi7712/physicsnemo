@@ -140,3 +140,13 @@ full_event_rollout: false
 # epoch indices to evaluate, plus CSV output path. Unused by train.py / inference.py.
 sweep_epochs: "4,9,14,19,24,29,34,39,44,49"
 sweep_csv: sweep_results.csv
+
+# 2D depth datum (inference only). UrbanFlood water_level is referenced to each
+# cell's bed = the min_elevation column of 2d_nodes_static.csv, which the loader
+# carries through under the mis-named "infiltration" stats key. Set to
+# "elevation" only to replay the pre-2026-08-30 behaviour for verification.
+# 1D nodes always keep their own datum (manhole surface elevation).
+depth_datum: min_elevation
+# Write depths.npz (raw 2D pred/gt depth fields, float32, feet) beside
+# metrics.json so CSI can be re-thresholded without another GPU run.
+save_depth_fields: true
