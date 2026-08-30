@@ -40,6 +40,7 @@ from hydra.utils import to_absolute_path
 
 from physicsnemo.utils import load_checkpoint
 from metrics import (
+    compute_contingency,
     compute_csi,
     compute_mass_balance_error,
     compute_mass_balance_residual,
@@ -51,6 +52,32 @@ from physicsnemo.models.meshgraphnet.meshgraphkan import MeshGraphKAN
 from model import HydroGraphKANWithEdgeDecoder
 
 from torch_geometric.utils import to_networkx
+
+
+# UrbanFlood is in US survey FEET; every reported depth converts with x304.8.
+MM_PER_FT = 304.8
+# CSI thresholds are DEFINED IN MILLIMETRES and converted here, so the reported
+# pair matches HGN-Data (50 mm / 300 mm) and the two datasets' CSI columns are
+# comparable for the first time.
+CSI_PRIMARY_MM = (50.0, 300.0)
+# Full sweep, so CSI can be re-read at any threshold without another GPU run.
+CSI_SWEEP_MM = (3.0, 6.0, 15.0, 30.0, 50.0, 91.0, 152.0, 305.0)
+# The historical pair was defined in FEET, and 15 mm / 91 mm are near but NOT
+# equal to it (0.049213 ft / 0.298556 ft). Keep it defined in feet and emit it
+# unchanged alongside the new keys so old and new numbers stay comparable.
+CSI_LEGACY_FT = (0.05, 0.30)
+
+
+def _mm_key(threshold_mm: float) -> str:
+    """Stable dict key for a millimetre threshold ('50' , '0.5', ...)."""
+    return f"{threshold_mm:g}"
+
+
+def _pooled(counts) -> float:
+    """CSI from a summed (hits, false_alarms, misses) contingency table."""
+    tp, fp, fn = counts
+    denom = tp + fp + fn
+    return float("nan") if denom == 0 else tp / denom
 
 
 def create_animation(
@@ -264,6 +291,53 @@ def main(cfg: DictConfig):
     elev_std = elev_std_raw[0] if isinstance(elev_std_raw, list) else elev_std_raw
     epsilon = 1e-8
 
+    # ------------------------------------------------------------------
+    # 2D depth datum. UrbanFlood `water_level` is referenced to each cell's BED
+    # — the `min_elevation` column (5) of 2d_nodes_static.csv — not to
+    # `elevation` (column 6). On a dry event water_level == min_elevation for
+    # every cell exactly (in float32); on a wet event it is above it for every
+    # cell; it is never below it. Subtracting `elevation`, which sits a median
+    # of 264 mm (City 1) / 326 mm (City 2) higher, made the clamp below swallow
+    # 60-73% of cell-steps that were holding 5-28 cm of water, corrupting RMSE,
+    # the NSE gate, NSE and both CSIs.
+    #
+    # min_elevation needs no new node feature: the loader already standardises
+    # it and stores it under the historically mis-named "infiltration" key
+    # (hydrographnet_dataset.py, `standardize(min_elev, "infiltration")`),
+    # including its NaN->elevation fill. Denormalising that array in float64
+    # recovers the physical bed level exactly.
+    #
+    # `depth_datum=elevation` reproduces the old behaviour bit-for-bit and
+    # exists only so the pre-fix artifacts can be replayed through this code
+    # for verification. It is not a study variable.
+    depth_datum = str(cfg.get("depth_datum", "min_elevation"))
+    if depth_datum not in ("min_elevation", "elevation"):
+        raise ValueError(
+            f"depth_datum must be 'min_elevation' or 'elevation', got {depth_datum!r}"
+        )
+    n_2d_nodes = int(test_dataset.num_2d_nodes)
+    infil_mean_raw = test_dataset.static_stats["infiltration"]["mean"]
+    infil_std_raw = test_dataset.static_stats["infiltration"]["std"]
+    infil_mean = (
+        infil_mean_raw[0] if isinstance(infil_mean_raw, list) else infil_mean_raw
+    )
+    infil_std = infil_std_raw[0] if isinstance(infil_std_raw, list) else infil_std_raw
+    min_elev_2d_ft = (
+        np.asarray(test_dataset.static_data["infiltration"], dtype=np.float64).reshape(-1)
+        * (float(infil_std) + epsilon)
+        + float(infil_mean)
+    )
+    if min_elev_2d_ft.shape[0] != n_2d_nodes:
+        raise ValueError(
+            f"min_elevation array has {min_elev_2d_ft.shape[0]} rows but the "
+            f"graph reports {n_2d_nodes} 2D nodes"
+        )
+    print(
+        f"2D depth datum: {depth_datum} "
+        f"(n_2d={n_2d_nodes}, mean={min_elev_2d_ft.mean():.4f} ft "
+        f"vs elevation mean={elev_mean:.4f} ft)"
+    )
+
     # Instantiate the model.
     use_local_physics_loss = cfg.get("use_local_physics_loss", False)
     model_args = dict(
@@ -323,6 +397,33 @@ def main(cfg: DictConfig):
     tau_wet = float(cfg.get("scalefree_tau", 0.01))  # min GT std (ft) for NSE conditioning
     per_hydrograph = {}
 
+    # Pooled CSI: sum the contingency table over cells x steps x events and form
+    # ONE ratio per run, instead of averaging per-step CSI with NaNs dropped.
+    # ADDED alongside the legacy mean; nothing existing is replaced.
+    # Union, so the reported pair is always present even if it is not one of
+    # the round sweep values (300 mm is not; 305 mm = 1.00 ft is).
+    csi_thresholds_ft = {
+        _mm_key(mm): mm / MM_PER_FT
+        for mm in sorted(set(CSI_SWEEP_MM) | set(CSI_PRIMARY_MM))
+    }
+    run_contingency = {k: [0, 0, 0] for k in csi_thresholds_ft}       # tp, fp, fn
+    run_legacy_contingency = {f"{t:.2f}": [0, 0, 0] for t in CSI_LEGACY_FT}
+    # Positive-class size: how much of the GT field actually clears each
+    # threshold, so a CSI computed on 1% of cells is visibly that.
+    run_gt_positive = {k: 0 for k in csi_thresholds_ft}
+    run_events_with_gt = {k: 0 for k in csi_thresholds_ft}
+    run_steps_with_gt = {k: 0 for k in csi_thresholds_ft}
+    # How many events/steps the NaN-dropping MEAN actually scored — this is the
+    # count that diverges between arms and the reason pooling was added.
+    run_steps_scored_mean = {k: 0 for k in csi_thresholds_ft}
+    run_events_scored_mean = {k: 0 for k in csi_thresholds_ft}
+    run_cell_steps = 0          # total 2D cell-steps entering the CSI field
+    run_steps_nse = 0           # steps passing the tau_wet gate
+    run_events_nse = 0          # events with at least one conditioned step
+    # Raw depth fields, so CSI can be re-thresholded without another GPU run.
+    save_depth_fields = bool(cfg.get("save_depth_fields", True))
+    depth_store = {}            # event_id -> (pred [T, n_2d], gt [T, n_2d])
+
     # Loop over each test event.
     for idx in range(len(test_dataset)):
         g, rollout_data = test_dataset[idx]
@@ -346,6 +447,15 @@ def main(cfg: DictConfig):
         rmse_over_sigma_list = []  # companion global RSR = RMSE_2d / max(std_gt, tau)
         nse_2d_series = []         # step-aligned NSE (NaN on unconditioned steps)
         sd_gt_2d_list = []         # per-step GT spatial std (ft)
+        # Per-event CSI sweep: pooled contingency + step-mean, at every threshold.
+        ev_contingency = {k: [0, 0, 0] for k in csi_thresholds_ft}
+        ev_csi_series = {k: [] for k in csi_thresholds_ft}
+        ev_legacy_contingency = {f"{t:.2f}": [0, 0, 0] for t in CSI_LEGACY_FT}
+        ev_gt_positive = {k: 0 for k in csi_thresholds_ft}
+        ev_steps_with_gt = {k: 0 for k in csi_thresholds_ft}
+        ev_cell_steps = 0
+        ev_pred_depths = []        # 2D-only pred depth per step (ft), for depths.npz
+        ev_gt_depths = []
         mbe_ft6_list = []
         mbe_m6_list = []
         mbe_gt_ft6_list = []
@@ -370,6 +480,33 @@ def main(cfg: DictConfig):
         # so denormalising recovers each node's relevant surface elevation.
         elev_norm = X_current[:, 3]
         elev_real = elev_norm * (elev_std + epsilon) + elev_mean
+
+        # Swap the 2D rows onto the bed datum. `elev_real` is left untouched so
+        # the 1D rows keep their exact pre-fix float32 round-trip and their
+        # depths stay bit-identical; only node_type == 0 moves.
+        if depth_datum == "min_elevation":
+            if node_type is not None:
+                # The unified graph is built as vstack([2D, 1D]) in the loader's
+                # _unified_static_blocks, so the first n_2d rows are the 2D ones.
+                # Assert it rather than trust it — a silent reordering here would
+                # put the bed datum on manholes.
+                if not bool((node_type[:n_2d_nodes] == 0).all()) or not bool(
+                    (node_type[n_2d_nodes:] == 1).all()
+                ):
+                    raise RuntimeError(
+                        "node ordering is not [2D block, 1D block]; refusing to "
+                        "apply the 2D depth datum by position"
+                    )
+            elif num_nodes != n_2d_nodes:
+                raise RuntimeError(
+                    f"2D-only schema expects {n_2d_nodes} nodes, graph has {num_nodes}"
+                )
+            datum_real = elev_real.clone()
+            datum_real[:n_2d_nodes] = torch.as_tensor(
+                min_elev_2d_ft, device=device, dtype=elev_real.dtype
+            )
+        else:
+            datum_real = elev_real
 
         # v2: build per-node water-depth (mean, std) tensors. For 2D-only
         # runs these collapse to scalar broadcasts of the legacy values.
@@ -463,8 +600,8 @@ def main(cfg: DictConfig):
             # mean/std handles per-type stats under use_1d.
             pred_wl = new_wd.squeeze(1) * (wd_std_per_node + epsilon) + wd_mean_per_node
             gt_wl   = wd_gt_seq[t]      * (wd_std_per_node + epsilon) + wd_mean_per_node
-            pred_depth = torch.clamp(pred_wl - elev_real, min=0.0)
-            gt_depth = torch.clamp(gt_wl - elev_real, min=0.0)
+            pred_depth = torch.clamp(pred_wl - datum_real, min=0.0)
+            gt_depth = torch.clamp(gt_wl - datum_real, min=0.0)
 
             # HydroGraphNet paper Eq. 33 on the governing 2D surface domain.
             # UF rainfall is already an interval depth in inches, so convert it
@@ -571,6 +708,38 @@ def main(cfg: DictConfig):
                     csi005_2d_list.append(compute_csi(p2, g2, 0.05))
                     csi030_2d_list.append(compute_csi(p2, g2, 0.30))
                     rmse_over_sigma_list.append(rmse_2d / max(sd_gt, tau_wet))
+
+                    # --- CSI sweep: pooled contingency + step-mean, per mm ---
+                    ev_cell_steps += int(g2.numel())
+                    for key, thr_ft in csi_thresholds_ft.items():
+                        tp, fp, fn = compute_contingency(p2, g2, thr_ft)
+                        acc = ev_contingency[key]
+                        acc[0] += tp
+                        acc[1] += fp
+                        acc[2] += fn
+                        ev_csi_series[key].append(
+                            float("nan") if (tp + fp + fn) == 0 else tp / (tp + fp + fn)
+                        )
+                        n_gt_pos = tp + fn      # GT cells clearing the threshold
+                        ev_gt_positive[key] += n_gt_pos
+                        if n_gt_pos > 0:
+                            ev_steps_with_gt[key] += 1
+                    # Legacy ft-defined pair, pooled. The per-step mean form of
+                    # these two is csi005_2d_list / csi030_2d_list, unchanged.
+                    for thr_ft in CSI_LEGACY_FT:
+                        tp, fp, fn = compute_contingency(p2, g2, thr_ft)
+                        acc = ev_legacy_contingency[f"{thr_ft:.2f}"]
+                        acc[0] += tp
+                        acc[1] += fp
+                        acc[2] += fn
+
+                    if save_depth_fields:
+                        ev_pred_depths.append(
+                            p2.detach().to(torch.float32).cpu().numpy()
+                        )
+                        ev_gt_depths.append(
+                            g2.detach().to(torch.float32).cpu().numpy()
+                        )
                     if sd_gt >= tau_wet:
                         _nse_step = compute_nse(p2, g2)
                         nse_2d_list.append(_nse_step)
@@ -625,6 +794,37 @@ def main(cfg: DictConfig):
             sum(rmse_over_sigma_list) / len(rmse_over_sigma_list)
             if rmse_over_sigma_list else float("nan")
         )
+
+        # --- Fold this event's CSI sweep into the run-level accumulators ---
+        ev_csi_pooled = {k: _pooled(v) for k, v in ev_contingency.items()}
+        ev_csi_mean = {k: _nanmean(v) for k, v in ev_csi_series.items()}
+        ev_gt_frac = {
+            k: (ev_gt_positive[k] / ev_cell_steps if ev_cell_steps else float("nan"))
+            for k in ev_contingency
+        }
+        run_cell_steps += ev_cell_steps
+        for key in run_contingency:
+            for i in range(3):
+                run_contingency[key][i] += ev_contingency[key][i]
+            run_gt_positive[key] += ev_gt_positive[key]
+            run_steps_with_gt[key] += ev_steps_with_gt[key]
+            if ev_gt_positive[key] > 0:
+                run_events_with_gt[key] += 1
+            n_scored = sum(1 for v in ev_csi_series[key] if not math.isnan(v))
+            run_steps_scored_mean[key] += n_scored
+            if n_scored > 0:
+                run_events_scored_mean[key] += 1
+        for key in run_legacy_contingency:
+            for i in range(3):
+                run_legacy_contingency[key][i] += ev_legacy_contingency[key][i]
+        run_steps_nse += len(nse_2d_list)
+        if nse_2d_list:
+            run_events_nse += 1
+        if save_depth_fields and ev_pred_depths:
+            depth_store[str(sample_id)] = (
+                np.stack(ev_pred_depths), np.stack(ev_gt_depths)
+            )
+
         per_hydrograph[str(sample_id)] = {
             "mean_rmse": mean_rmse_2d,            # 2D-only, feet (governing field)
             "mean_rmse_allnodes": mean_rmse_sample,
@@ -672,6 +872,28 @@ def main(cfg: DictConfig):
             "abs_balance_depth_mm_series": list(balance_depth_mm_list),
             "abs_balance_depth_gt_mm_series": list(balance_depth_gt_mm_list),
             "sd_gt_series": list(sd_gt_2d_list),
+            # --- ADDED: CSI sweep. Keys are thresholds in MILLIMETRES. The
+            # legacy mean_csi_005 / mean_csi_030 above are untouched; these are
+            # the pooled (contingency-summed) forms plus the wider sweep. ---
+            "csi_pooled_mm": ev_csi_pooled,
+            "csi_mean_mm": ev_csi_mean,
+            "contingency_mm": {k: list(v) for k, v in ev_contingency.items()},
+            "csi_pooled_legacy_ft": {
+                k: _pooled(v) for k, v in ev_legacy_contingency.items()
+            },
+            "contingency_legacy_ft": {
+                k: list(v) for k, v in ev_legacy_contingency.items()
+            },
+            # New reported pair (50 mm / 300 mm), matching HGN-Data.
+            "mean_csi_050mm": ev_csi_mean[_mm_key(50.0)],
+            "mean_csi_300mm": ev_csi_mean[_mm_key(300.0)],
+            "csi_050mm_2d_series": list(ev_csi_series[_mm_key(50.0)]),
+            "csi_300mm_2d_series": list(ev_csi_series[_mm_key(300.0)]),
+            # Positive-class size: fraction of GT cell-steps clearing each
+            # threshold, and how many steps had ANY exceedance.
+            "gt_positive_fraction_mm": ev_gt_frac,
+            "n_steps_with_gt_exceedance_mm": dict(ev_steps_with_gt),
+            "n_cell_steps_2d": ev_cell_steps,
         }
 
         if save_animations:
@@ -721,6 +943,16 @@ def main(cfg: DictConfig):
             "use_local_physics_loss": bool(use_local_physics_loss),
             "scalefree_tau": tau_wet,
             "n_events": len(per_hydrograph),
+            "depth_datum": depth_datum,
+            "depth_datum_note": (
+                "2D depth = water_level - min_elevation (cell bed). 1D nodes keep "
+                "their own datum (manhole surface elevation). depth_datum="
+                "'elevation' reproduces the pre-2026-08-30 behaviour."
+            ),
+            "csi_threshold_units": "mm (converted with ft = mm / 304.8)",
+            "csi_sweep_mm": list(csi_thresholds_ft),
+            "csi_primary_mm": list(CSI_PRIMARY_MM),
+            "csi_legacy_ft": list(CSI_LEGACY_FT),
             "mbe_definition": "HydroGraphNet Eq. 33 squared global continuity residual",
             "mbe_volume_scope": "2D surface nodes",
             "mbe_native_unit": "ft^6",
@@ -757,6 +989,39 @@ def main(cfg: DictConfig):
             "n_scalefree_undefined": sum(
                 1 for v in per_hydrograph.values() if not v["scalefree_defined"]
             ),
+            # --- ADDED. The two keys above (csi_005_mean / csi_030_mean) are a
+            # mean-of-per-event-means over NaN-dropped steps, so each ARM is
+            # scored on whichever events its own prediction happened to wet.
+            # The pooled values below sum one contingency table over all
+            # cells x steps x events and are therefore arm-independent. ---
+            "csi_005_pooled": _pooled(run_legacy_contingency["0.05"]),
+            "csi_030_pooled": _pooled(run_legacy_contingency["0.30"]),
+            "contingency_legacy_ft": {
+                k: list(v) for k, v in run_legacy_contingency.items()
+            },
+            "csi_pooled_mm": {
+                k: _pooled(v) for k, v in run_contingency.items()
+            },
+            "contingency_mm": {k: list(v) for k, v in run_contingency.items()},
+            # New reported pair, defined in mm to match HGN-Data.
+            "csi_050mm_pooled": _pooled(run_contingency[_mm_key(50.0)]),
+            "csi_300mm_pooled": _pooled(run_contingency[_mm_key(300.0)]),
+            "csi_050mm_mean": _mean_defined("mean_csi_050mm"),
+            "csi_300mm_mean": _mean_defined("mean_csi_300mm"),
+            # Positive-class size and what each metric actually scored.
+            "n_cell_steps_2d": run_cell_steps,
+            "gt_positive_fraction_mm": {
+                k: (run_gt_positive[k] / run_cell_steps
+                    if run_cell_steps else float("nan"))
+                for k in run_contingency
+            },
+            "n_gt_positive_cell_steps_mm": dict(run_gt_positive),
+            "n_events_with_gt_exceedance_mm": dict(run_events_with_gt),
+            "n_steps_with_gt_exceedance_mm": dict(run_steps_with_gt),
+            "n_events_scored_csi_mean_mm": dict(run_events_scored_mean),
+            "n_steps_scored_csi_mean_mm": dict(run_steps_scored_mean),
+            "n_events_nse": run_events_nse,
+            "n_steps_nse": run_steps_nse,
         },
         "per_hydrograph": per_hydrograph,
     }
@@ -768,6 +1033,39 @@ def main(cfg: DictConfig):
         f"({len(per_hydrograph)} events, "
         f"{metrics_output['overall']['n_scalefree_undefined']} scale-free undefined)"
     )
+
+    # Raw 2D depth fields, so CSI can be re-thresholded (or RMSE recomputed)
+    # without another GPU run. float32, in FEET; convert with x304.8.
+    if save_depth_fields and depth_store:
+        event_ids = list(depth_store)
+        steps = [depth_store[e][0].shape[0] for e in event_ids]
+        arrays = {
+            "event_ids": np.array(event_ids),
+            "steps_per_event": np.array(steps, dtype=np.int32),
+            "n_2d_cells": np.array(n_2d_nodes, dtype=np.int32),
+            "units": np.array("ft"),
+            "mm_per_ft": np.array(MM_PER_FT),
+            "datum": np.array(depth_datum),
+        }
+        if len(set(steps)) == 1:
+            # Uniform rollout length: one stacked cube, [n_events, T, n_cells].
+            arrays["layout"] = np.array("stacked")
+            arrays["pred"] = np.stack([depth_store[e][0] for e in event_ids])
+            arrays["gt"] = np.stack([depth_store[e][1] for e in event_ids])
+        else:
+            # Full-event rollouts are ragged (92/95/203/443 steps in one
+            # bucket); padding to the max would inflate the file for no gain.
+            arrays["layout"] = np.array("ragged")
+            for e in event_ids:
+                arrays[f"pred_{e}"], arrays[f"gt_{e}"] = depth_store[e]
+        depths_path = os.path.join(anim_output_dir, "depths.npz")
+        np.savez_compressed(depths_path, **arrays)
+        print(
+            f"Wrote 2D depth fields to {depths_path} "
+            f"({arrays['layout']}, {len(event_ids)} events, "
+            f"{sum(steps)} steps x {n_2d_nodes} cells, "
+            f"{os.path.getsize(depths_path) / 1e6:.1f} MB)"
+        )
 
     # 5 minutes per step for UrbanFlood. Only meaningful when every event shares
     # one rollout length (guarded); skipped for variable-length full-event runs.

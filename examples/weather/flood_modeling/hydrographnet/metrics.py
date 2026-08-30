@@ -56,6 +56,27 @@ def compute_csi(pred: torch.Tensor, gt: torch.Tensor, threshold: float) -> float
     return hits / denom
 
 
+def compute_contingency(
+    pred: torch.Tensor, gt: torch.Tensor, threshold: float
+) -> tuple[int, int, int]:
+    """Return the raw (hits, false_alarms, misses) counts behind ``compute_csi``.
+
+    Exposing the counts lets a caller SUM them over cells, steps and events and
+    form a single pooled CSI = hits / (hits + false_alarms + misses) per run.
+    That is not the same as averaging per-step CSI: ``compute_csi`` returns NaN
+    whenever neither the prediction nor the truth exceeds the threshold, and a
+    NaN-dropping mean therefore scores each arm on whichever steps its OWN
+    prediction happened to wet. Pooling removes that divergence and lets a dry
+    step contribute false alarms rather than being discarded as 0/0.
+    """
+    pred_exceed = pred >= threshold
+    gt_exceed = gt >= threshold
+    hits = int((pred_exceed & gt_exceed).sum().item())
+    false_alarms = int((pred_exceed & ~gt_exceed).sum().item())
+    misses = int((~pred_exceed & gt_exceed).sum().item())
+    return hits, false_alarms, misses
+
+
 def compute_mass_balance_residual(
     current_volume: torch.Tensor,
     previous_volume: torch.Tensor,
