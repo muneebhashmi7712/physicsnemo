@@ -427,6 +427,7 @@ def main(cfg: DictConfig):
     # Loop over each test event.
     for idx in range(len(test_dataset)):
         g, rollout_data = test_dataset[idx]
+        event_id = test_dataset.dynamic_data[idx].get("event_id", idx)
         g = g.to(device)
         edge_features = g.edge_attr.to(device)
         X_current = g.x.to(device)
@@ -643,6 +644,26 @@ def main(cfg: DictConfig):
             net_source_rate_ft3_s = (
                 rainfall_rate_ft3_s - drainage_outflow_seq[t]
             )
+            # Preserve the strict numerical gate in metrics.py, but identify
+            # the event, rollout step, and exact input field when it trips.
+            # This is diagnostic-only: finite runs execute bit-identically.
+            mass_inputs = {
+                "pred_volume": pred_vol_real[mbe_mask],
+                "previous_pred_volume": previous_pred_vol_real[mbe_mask],
+                "net_source_rate": net_source_rate_ft3_s,
+                "gt_volume": gt_vol_real[mbe_mask],
+                "previous_gt_volume": previous_gt_vol_real[mbe_mask],
+            }
+            nonfinite = {
+                name: int((~torch.isfinite(value)).sum().item())
+                for name, value in mass_inputs.items()
+                if not torch.isfinite(value).all().item()
+            }
+            if nonfinite:
+                raise FloatingPointError(
+                    "non-finite mass-balance input before Eq33: "
+                    f"event={event_id}, rollout_step={t}, fields={nonfinite}"
+                )
             mass_residual_ft3 = compute_mass_balance_residual(
                 pred_vol_real[mbe_mask],
                 previous_pred_vol_real[mbe_mask],
@@ -760,7 +781,7 @@ def main(cfg: DictConfig):
         if rmse_1d_list:
             all_rmse_1d.append(rmse_1d_list)
         mean_rmse_sample = sum(rmse_list) / len(rmse_list)
-        sample_id = test_dataset.dynamic_data[idx].get("event_id", idx)
+        sample_id = event_id
         if rmse_2d_list and rmse_1d_list:
             print(
                 f"Event {sample_id}: Mean RMSE = {mean_rmse_sample:.4f} ft | "

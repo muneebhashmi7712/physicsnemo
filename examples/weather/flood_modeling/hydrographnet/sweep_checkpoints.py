@@ -18,6 +18,7 @@ for diagnostics but do not drive the decision.
 
 import csv
 import os
+import numpy as np
 import torch
 import hydra
 from omegaconf import DictConfig, OmegaConf
@@ -58,7 +59,7 @@ def build_model(cfg, device):
 
 @torch.no_grad()
 def evaluate_rollout(model, test_dataset, cfg, device):
-    """Run full test-set rollout, return (mean_total, mean_2d, mean_1d) in feet."""
+    """Run the fixed test rollout with the authoritative depth datum."""
     rollout_length = cfg.get("num_test_time_steps", 8)
     n_time_steps = cfg.get("n_time_steps", 2)
     use_1d = cfg.get("use_1d", False)
@@ -78,7 +79,35 @@ def evaluate_rollout(model, test_dataset, cfg, device):
     elev_std = elev_std_raw[0] if isinstance(elev_std_raw, list) else elev_std_raw
     epsilon = 1e-8
 
+    depth_datum = str(cfg.get("depth_datum", "min_elevation"))
+    if depth_datum not in ("min_elevation", "elevation"):
+        raise ValueError(
+            f"depth_datum must be 'min_elevation' or 'elevation', got {depth_datum!r}"
+        )
+    n_2d_nodes = int(test_dataset.num_2d_nodes)
+    infil_mean_raw = test_dataset.static_stats["infiltration"]["mean"]
+    infil_std_raw = test_dataset.static_stats["infiltration"]["std"]
+    infil_mean = (
+        infil_mean_raw[0] if isinstance(infil_mean_raw, list) else infil_mean_raw
+    )
+    infil_std = infil_std_raw[0] if isinstance(infil_std_raw, list) else infil_std_raw
+    min_elev_2d_ft = (
+        np.asarray(test_dataset.static_data["infiltration"], dtype=np.float64).reshape(-1)
+        * (float(infil_std) + epsilon)
+        + float(infil_mean)
+    )
+    if min_elev_2d_ft.shape[0] != n_2d_nodes:
+        raise ValueError(
+            f"min_elevation array has {min_elev_2d_ft.shape[0]} rows but the "
+            f"graph reports {n_2d_nodes} 2D nodes"
+        )
+    print(
+        f"2D depth datum: {depth_datum} "
+        f"(n_2d={n_2d_nodes}, mean={min_elev_2d_ft.mean():.4f} ft)"
+    )
+
     all_rmse_all, all_rmse_2d, all_rmse_1d = [], [], []
+    per_event_2d = []
 
     for idx in range(len(test_dataset)):
         g, rollout_data = test_dataset[idx]
@@ -95,6 +124,25 @@ def evaluate_rollout(model, test_dataset, cfg, device):
 
         elev_norm = X_current[:, 3]
         elev_real = elev_norm * (elev_std + epsilon) + elev_mean
+        if depth_datum == "min_elevation":
+            if node_type is not None:
+                if not bool((node_type[:n_2d_nodes] == 0).all()) or not bool(
+                    (node_type[n_2d_nodes:] == 1).all()
+                ):
+                    raise RuntimeError(
+                        "node ordering is not [2D block, 1D block]; refusing to "
+                        "apply the 2D depth datum by position"
+                    )
+            elif num_nodes != n_2d_nodes:
+                raise RuntimeError(
+                    f"2D-only schema expects {n_2d_nodes} nodes, graph has {num_nodes}"
+                )
+            datum_real = elev_real.clone()
+            datum_real[:n_2d_nodes] = torch.as_tensor(
+                min_elev_2d_ft, device=device, dtype=elev_real.dtype
+            )
+        else:
+            datum_real = elev_real
 
         if use_1d and node_type is not None:
             is_1d = node_type == 1
@@ -143,8 +191,8 @@ def evaluate_rollout(model, test_dataset, cfg, device):
 
             pred_wl = new_wd.squeeze(1) * (wd_std_per_node + epsilon) + wd_mean_per_node
             gt_wl = wd_gt_seq[t] * (wd_std_per_node + epsilon) + wd_mean_per_node
-            pred_depth = torch.clamp(pred_wl - elev_real, min=0.0)
-            gt_depth = torch.clamp(gt_wl - elev_real, min=0.0)
+            pred_depth = torch.clamp(pred_wl - datum_real, min=0.0)
+            gt_depth = torch.clamp(gt_wl - datum_real, min=0.0)
 
             rmse = torch.sqrt(torch.mean((pred_depth - gt_depth) ** 2)).item()
             rmse_list.append(rmse)
@@ -163,14 +211,17 @@ def evaluate_rollout(model, test_dataset, cfg, device):
 
         all_rmse_all.append(sum(rmse_list) / len(rmse_list))
         if rmse_2d_list:
-            all_rmse_2d.append(sum(rmse_2d_list) / len(rmse_2d_list))
+            event_mean_2d = sum(rmse_2d_list) / len(rmse_2d_list)
+            all_rmse_2d.append(event_mean_2d)
+            event_id = test_dataset.dynamic_data[idx].get("event_id", idx)
+            per_event_2d.append((str(event_id), event_mean_2d))
         if rmse_1d_list:
             all_rmse_1d.append(sum(rmse_1d_list) / len(rmse_1d_list))
 
     mean_total = sum(all_rmse_all) / len(all_rmse_all)
     mean_2d = sum(all_rmse_2d) / len(all_rmse_2d) if all_rmse_2d else float("nan")
     mean_1d = sum(all_rmse_1d) / len(all_rmse_1d) if all_rmse_1d else float("nan")
-    return mean_total, mean_2d, mean_1d
+    return mean_total, mean_2d, mean_1d, per_event_2d
 
 
 @hydra.main(version_base="1.3", config_path="conf", config_name="config")
@@ -182,6 +233,7 @@ def main(cfg: DictConfig):
     sweep_epochs_str = str(cfg.get("sweep_epochs", "4,9,14,19,24,29,34,39,44,49"))
     sweep_epochs = [int(e) for e in sweep_epochs_str.split(",") if e.strip() != ""]
     out_csv = cfg.get("sweep_csv", "sweep_results.csv")
+    event_csv = cfg.get("sweep_event_csv", "sweep_event_results.csv")
 
     print("Configuration:\n", OmegaConf.to_yaml(cfg))
     print(f"Sweeping {len(sweep_epochs)} epochs: {sweep_epochs}")
@@ -203,6 +255,7 @@ def main(cfg: DictConfig):
     model = build_model(cfg, device)
 
     rows = []
+    event_rows = []
     for ep in sweep_epochs:
         epoch_loaded = load_checkpoint(
             to_absolute_path(ckpt_path),
@@ -213,8 +266,12 @@ def main(cfg: DictConfig):
             epoch=ep,
             device=device,
         )
+        if int(epoch_loaded) != ep:
+            raise RuntimeError(
+                f"requested checkpoint epoch {ep}, but loader reported {epoch_loaded}"
+            )
         model.eval()
-        mean_total, mean_2d, mean_1d = evaluate_rollout(
+        mean_total, mean_2d, mean_1d, per_event_2d = evaluate_rollout(
             model, test_dataset, cfg, device
         )
         print(
@@ -225,6 +282,10 @@ def main(cfg: DictConfig):
         rows.append(
             dict(epoch=ep, mean_2d=mean_2d, mean_1d=mean_1d, mean_total=mean_total)
         )
+        for event_id, event_mean_2d in per_event_2d:
+            event_rows.append(
+                dict(epoch=ep, event_id=event_id, mean_2d=event_mean_2d)
+            )
 
     out_csv_abs = to_absolute_path(out_csv)
     os.makedirs(os.path.dirname(out_csv_abs) or ".", exist_ok=True)
@@ -234,6 +295,15 @@ def main(cfg: DictConfig):
         for r in rows:
             w.writerow(r)
     print(f"Wrote sweep CSV to {out_csv_abs}")
+
+    event_csv_abs = to_absolute_path(event_csv)
+    os.makedirs(os.path.dirname(event_csv_abs) or ".", exist_ok=True)
+    with open(event_csv_abs, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=["epoch", "event_id", "mean_2d"])
+        w.writeheader()
+        for r in event_rows:
+            w.writerow(r)
+    print(f"Wrote per-event sweep CSV to {event_csv_abs}")
 
     best = min(rows, key=lambda r: r["mean_2d"])
     print(

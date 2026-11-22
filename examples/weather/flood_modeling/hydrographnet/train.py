@@ -20,12 +20,14 @@ Identical to train.py except for dataset import/instantiation and config name.
 """
 
 import os
+import random
 import time
 
 import hydra
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import numpy as np
 import torch
 import torch.nn as nn
 import torch_geometric as pyg
@@ -152,6 +154,7 @@ class MGNTrainer:
             drop_last=True,
             num_replicas=self.dist.world_size,
             rank=self.dist.rank,
+            seed=int(cfg.get("seed", 0) or 0),
         )
         self.dataloader = PyGDataLoader(
             dataset,
@@ -245,14 +248,26 @@ class MGNTrainer:
         rank_zero_logger.info("Loading checkpoint if available...")
         if self.dist.world_size > 1:
             torch.distributed.barrier()
-        self.epoch_init = load_checkpoint(
-            to_absolute_path(cfg.ckpt_path),
+        checkpoint_dir = to_absolute_path(cfg.ckpt_path)
+        checkpoint_was_present = os.path.isdir(checkpoint_dir) and any(
+            name.startswith("checkpoint.") and name.endswith(".pt")
+            for name in os.listdir(checkpoint_dir)
+        )
+        loaded_epoch = load_checkpoint(
+            checkpoint_dir,
             models=self.model,
             optimizer=self.optimizer,
             scheduler=self.scheduler,
             scaler=self.scaler,
             device=self.dist.device,
         )
+        self.epoch_init = loaded_epoch
+        if cfg.get("resume_next_epoch", False) and checkpoint_was_present:
+            self.epoch_init += 1
+            rank_zero_logger.info(
+                f"Checkpoint epoch {loaded_epoch} is complete; "
+                f"resuming at epoch {self.epoch_init}."
+            )
         rank_zero_logger.info(
             f"Checkpoint loaded. Starting training from epoch {self.epoch_init}."
         )
@@ -557,6 +572,18 @@ class MGNTrainer:
 def main(cfg: DictConfig) -> None:
     DistributedManager.initialize()
     dist = DistributedManager()
+    # Historically these runs did not expose a reproducible training seed:
+    # DistributedManager fixed NumPy to the rank, while torch model
+    # initialization used process entropy. Keep that legacy behavior when
+    # seed is null, but allow controlled replicate runs when it is provided.
+    seed = cfg.get("seed", None)
+    if seed is not None:
+        rank_seed = int(seed) + dist.rank
+        random.seed(rank_seed)
+        np.random.seed(rank_seed)
+        torch.manual_seed(rank_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(rank_seed)
     initialize_wandb(
         project="UrbanFlood-HydroGraphNet",
         entity="Modulus",
@@ -567,6 +594,10 @@ def main(cfg: DictConfig) -> None:
     logger = PythonLogger("main")
     rank_zero_logger = RankZeroLoggingWrapper(logger, dist)
     rank_zero_logger.file_logging()
+    if seed is not None:
+        rank_zero_logger.info(
+            f"Using explicit training seed {int(seed)} (rank seed {rank_seed})."
+        )
     rank_zero_logger.info(f"Starting training process with configuration: {cfg}")
     trainer = MGNTrainer(cfg, rank_zero_logger)
     rank_zero_logger.info("Beginning training loop...")

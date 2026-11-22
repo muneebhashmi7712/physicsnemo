@@ -14,6 +14,12 @@ model_name: "Model_1"    # "Model_1" or "Model_2"
 # Training configuration.
 batch_size: 1
 epochs: 30
+# Optional reproducible training seed. null preserves the historical behavior
+# in which torch initialization was seeded from process entropy.
+seed: null
+# When true, a loaded checkpoint is treated as a completed epoch and training
+# resumes at the following epoch. Keep false for legacy runs.
+resume_next_epoch: false
 num_training_samples: 68   # All 68 train events for Model_1
 num_training_time_steps: 300
 lr: 0.0001
@@ -140,6 +146,7 @@ full_event_rollout: false
 # epoch indices to evaluate, plus CSV output path. Unused by train.py / inference.py.
 sweep_epochs: "4,9,14,19,24,29,34,39,44,49"
 sweep_csv: sweep_results.csv
+sweep_event_csv: sweep_event_results.csv
 
 # 2D depth datum (inference only). UrbanFlood water_level is referenced to each
 # cell's bed = the min_elevation column of 2d_nodes_static.csv, which the loader
